@@ -9,6 +9,10 @@ description = "Lisp REPL for the pwn_arena workspace"
 name = "lisp"
 path = "src/main.rs"
 
+[[bin]]
+name = "lisp-bench"
+path = "src/bench.rs"
+
 [dependencies]
 pwn_arena = { path = "../pwn_arena" }
 lisp_parser = { path = "../lisp_parser" }
