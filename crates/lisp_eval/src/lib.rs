@@ -1410,6 +1410,258 @@ mod tests {
     }
     
     #[test]
+    fn test_thunk_force_non_thunk() {
+        // Force on a non-thunk should return the value as-is
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force 42)"), 42);
+        assert!(eval_is_true(&lisp, &mut eval, "(force #t)"));
+        assert!(eval_is_false(&lisp, &mut eval, "(force #f)"));
+    }
+    
+    #[test]
+    fn test_thunk_nested_delay() {
+        // Nested delays - each force unwraps one layer
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        eval.eval_str("(define double-lazy (delay (delay 42)))").unwrap();
+        
+        // First force returns inner thunk
+        assert!(eval_is_true(&lisp, &mut eval, "(promise? (force double-lazy))"));
+        
+        // Force twice to get the value
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force (force double-lazy))"), 42);
+    }
+    
+    #[test]
+    fn test_thunk_captures_environment() {
+        // Thunks should capture their lexical environment
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        eval.eval_str("(define (make-lazy-adder x) (delay (+ x 10)))").unwrap();
+        eval.eval_str("(define lazy-add-5 (make-lazy-adder 5))").unwrap();
+        eval.eval_str("(define lazy-add-20 (make-lazy-adder 20))").unwrap();
+        
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-add-5)"), 15);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-add-20)"), 30);
+    }
+    
+    #[test]
+    fn test_thunk_in_data_structures() {
+        // Thunks can be stored in data structures
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        eval.eval_str("(define lazy-pair (cons (delay 1) (delay 2)))").unwrap();
+        
+        assert!(eval_is_true(&lisp, &mut eval, "(promise? (car lazy-pair))"));
+        assert!(eval_is_true(&lisp, &mut eval, "(promise? (cdr lazy-pair))"));
+        
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force (car lazy-pair))"), 1);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force (cdr lazy-pair))"), 2);
+    }
+    
+    #[test]
+    fn test_thunk_conditional_evaluation() {
+        // Thunks allow conditional evaluation of expensive operations
+        let lisp: Lisp<2000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        eval.eval_str("(define expensive-counter 0)").unwrap();
+        eval.eval_str("(define (expensive-op) (set! expensive-counter (+ expensive-counter 1)) 999)").unwrap();
+        
+        // Create thunks for both branches
+        eval.eval_str("(define then-branch (delay (expensive-op)))").unwrap();
+        eval.eval_str("(define else-branch (delay (expensive-op)))").unwrap();
+        
+        // Only force one branch based on condition
+        eval.eval_str("(define (lazy-if cond then else) (if cond (force then) (force else)))").unwrap();
+        
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(lazy-if #t then-branch else-branch)"), 999);
+        
+        // Only one expensive operation should have been executed
+        assert_eq!(eval_to_num(&lisp, &mut eval, "expensive-counter"), 1);
+    }
+    
+    #[test]
+    fn test_thunk_multiple_forces_same_result() {
+        // Multiple forces should always return the same result
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        eval.eval_str("(define counter 0)").unwrap();
+        eval.eval_str("(define thunk (delay (begin (set! counter (+ counter 1)) (* counter 10))))").unwrap();
+        
+        // Force multiple times
+        let r1 = eval_to_num(&lisp, &mut eval, "(force thunk)");
+        let r2 = eval_to_num(&lisp, &mut eval, "(force thunk)");
+        let r3 = eval_to_num(&lisp, &mut eval, "(force thunk)");
+        
+        assert_eq!(r1, 10);
+        assert_eq!(r2, 10);  // Should be same, not 20
+        assert_eq!(r3, 10);  // Should be same, not 30
+        
+        // Counter should only have been incremented once
+        assert_eq!(eval_to_num(&lisp, &mut eval, "counter"), 1);
+    }
+    
+    #[test]
+    fn test_thunk_with_closures() {
+        // Thunks work correctly with closures
+        let lisp: Lisp<2000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        eval.eval_str("(define (make-counter) (let ((n 0)) (delay (begin (set! n (+ n 1)) n))))").unwrap();
+        eval.eval_str("(define counter1 (make-counter))").unwrap();
+        eval.eval_str("(define counter2 (make-counter))").unwrap();
+        
+        // Each counter has its own environment
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force counter1)"), 1);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force counter1)"), 1);  // Memoized
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force counter2)"), 1);  // Independent
+    }
+    
+    #[test]
+    fn test_thunk_promise_predicate() {
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // promise? returns true only for thunks
+        assert!(eval_is_true(&lisp, &mut eval, "(promise? (delay 42))"));
+        assert!(eval_is_false(&lisp, &mut eval, "(promise? 42)"));
+        assert!(eval_is_false(&lisp, &mut eval, "(promise? '())"));
+        assert!(eval_is_false(&lisp, &mut eval, "(promise? #t)"));
+        assert!(eval_is_false(&lisp, &mut eval, "(promise? (lambda (x) x))"));
+        assert!(eval_is_false(&lisp, &mut eval, "(promise? +)"));
+    }
+    
+    #[test]
+    fn test_thunk_delay_does_not_evaluate() {
+        // delay should not evaluate its expression until forced
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        eval.eval_str("(define evaluated #f)").unwrap();
+        eval.eval_str("(define lazy-val (delay (begin (set! evaluated #t) 42)))").unwrap();
+        
+        // evaluated should still be false
+        assert!(eval_is_false(&lisp, &mut eval, "evaluated"));
+        
+        // Now force it
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-val)"), 42);
+        
+        // Now evaluated should be true
+        assert!(eval_is_true(&lisp, &mut eval, "evaluated"));
+    }
+    
+    #[test]
+    fn test_thunk_lazy_list_operations() {
+        // Implement simple lazy list operations
+        let lisp: Lisp<3000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Lazy cons: head is eager, tail is lazy
+        eval.eval_str("(define (lazy-cons head tail-thunk) (cons head tail-thunk))").unwrap();
+        eval.eval_str("(define (lazy-car stream) (car stream))").unwrap();
+        eval.eval_str("(define (lazy-cdr stream) (force (cdr stream)))").unwrap();
+        
+        // Create a lazy list: (1 2 3)
+        eval.eval_str("(define lazy-list (lazy-cons 1 (delay (lazy-cons 2 (delay (lazy-cons 3 (delay '())))))))").unwrap();
+        
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(lazy-car lazy-list)"), 1);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(lazy-car (lazy-cdr lazy-list))"), 2);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(lazy-car (lazy-cdr (lazy-cdr lazy-list)))"), 3);
+    }
+    
+    #[test]
+    fn test_thunk_avoids_infinite_computation() {
+        // Without laziness, this would loop forever
+        // With laziness, we only compute what we need
+        let lisp: Lisp<2000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Define a "take" that works with our lazy streams
+        eval.eval_str("(define (lazy-cons h t) (cons h t))").unwrap();
+        eval.eval_str("(define (lazy-car s) (car s))").unwrap();
+        eval.eval_str("(define (lazy-cdr s) (force (cdr s)))").unwrap();
+        
+        // Infinite stream of ones (well, would be infinite if we kept forcing)
+        eval.eval_str("(define ones (lazy-cons 1 (delay ones)))").unwrap();
+        
+        // We can safely get elements without infinite loop
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(lazy-car ones)"), 1);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(lazy-car (lazy-cdr ones))"), 1);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(lazy-car (lazy-cdr (lazy-cdr ones)))"), 1);
+    }
+    
+    #[test]
+    fn test_thunk_gc_preserves_thunks() {
+        // GC should preserve thunks that are still reachable
+        let lisp: Lisp<2000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        eval.eval_str("(define my-thunk (delay (+ 100 200)))").unwrap();
+        
+        // Create some garbage
+        for _ in 0..50 {
+            eval.eval_str("(+ 1 2)").unwrap();
+        }
+        
+        // Run GC
+        eval.gc();
+        
+        // Thunk should still work
+        assert!(eval_is_true(&lisp, &mut eval, "(promise? my-thunk)"));
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force my-thunk)"), 300);
+    }
+    
+    #[test]
+    fn test_thunk_gc_preserves_forced_value() {
+        // GC should preserve the cached value in a forced thunk
+        let lisp: Lisp<2000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        eval.eval_str("(define my-thunk (delay (cons 1 2)))").unwrap();
+        
+        // Force it to cache the result
+        eval.eval_str("(force my-thunk)").unwrap();
+        
+        // Create garbage and run GC
+        for _ in 0..50 {
+            eval.eval_str("(+ 1 2)").unwrap();
+        }
+        eval.gc();
+        
+        // Forced value should still be accessible
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(car (force my-thunk))"), 1);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(cdr (force my-thunk))"), 2);
+    }
+    
+    #[test]
+    fn test_thunk_expression_only_evaluated_once() {
+        // Even if expression has side effects, it should only run once
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        eval.eval_str("(define call-log '())").unwrap();
+        eval.eval_str("(define (log-and-return x) (set! call-log (cons x call-log)) x)").unwrap();
+        
+        eval.eval_str("(define lazy-42 (delay (log-and-return 42)))").unwrap();
+        
+        // Force multiple times
+        eval.eval_str("(force lazy-42)").unwrap();
+        eval.eval_str("(force lazy-42)").unwrap();
+        eval.eval_str("(force lazy-42)").unwrap();
+        
+        // log-and-return should only have been called once
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(car call-log)"), 42);
+        assert!(eval_is_true(&lisp, &mut eval, "(null? (cdr call-log))"));
+    }
+    
+    #[test]
     fn test_predicates() {
         let lisp: Lisp<1000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();

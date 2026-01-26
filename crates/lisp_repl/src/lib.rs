@@ -725,6 +725,219 @@ mod tests {
     }
     
     #[test]
+    fn test_thunk_memoization() {
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Side effect to track evaluation count
+        eval.eval_str("(define eval-count 0)").unwrap();
+        eval.eval_str("(define lazy-val (delay (begin (set! eval-count (+ eval-count 1)) 42)))").unwrap();
+        
+        // eval-count starts at 0
+        assert_eq!(eval_to_string(&lisp, &mut eval, "eval-count").unwrap(), "0");
+        
+        // Force multiple times
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-val)").unwrap(), "42");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-val)").unwrap(), "42");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-val)").unwrap(), "42");
+        
+        // Should only have evaluated once
+        assert_eq!(eval_to_string(&lisp, &mut eval, "eval-count").unwrap(), "1");
+    }
+    
+    #[test]
+    fn test_thunk_force_non_promise() {
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Force on non-thunks returns the value unchanged
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force 42)").unwrap(), "42");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force 'hello)").unwrap(), "hello");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force '(1 2 3))").unwrap(), "(1 2 3)");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force #t)").unwrap(), "#t");
+    }
+    
+    #[test]
+    fn test_thunk_captures_lexical_env() {
+        let lisp: Lisp<2000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Thunk captures the lexical environment at creation time
+        eval.eval_str("(define x 10)").unwrap();
+        eval.eval_str("(define lazy-x (delay x))").unwrap();
+        
+        // Change x
+        eval.eval_str("(set! x 20)").unwrap();
+        
+        // Thunk should see the value at force time (20), not creation time
+        // This is because we capture the environment, and x is mutated
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-x)").unwrap(), "20");
+    }
+    
+    #[test]
+    fn test_thunk_in_let_binding() {
+        let lisp: Lisp<2000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Thunk created in let captures the let's environment
+        eval.eval_str("(define (make-lazy n) (let ((x n)) (delay (+ x 100))))").unwrap();
+        eval.eval_str("(define lazy-110 (make-lazy 10))").unwrap();
+        eval.eval_str("(define lazy-200 (make-lazy 100))").unwrap();
+        
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-110)").unwrap(), "110");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-200)").unwrap(), "200");
+    }
+    
+    #[test]
+    fn test_thunk_nested() {
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Nested delays require nested forces
+        eval.eval_str("(define nested (delay (delay (delay 42))))").unwrap();
+        
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(promise? nested)").unwrap(), "#t");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(promise? (force nested))").unwrap(), "#t");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(promise? (force (force nested)))").unwrap(), "#t");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force (force (force nested)))").unwrap(), "42");
+    }
+    
+    #[test]
+    fn test_thunk_lazy_computation() {
+        let lisp: Lisp<2000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Define expensive computation tracker
+        eval.eval_str("(define computed '())").unwrap();
+        eval.eval_str("(define (track name val) (set! computed (cons name computed)) val)").unwrap();
+        
+        // Create lazy values
+        eval.eval_str("(define lazy-a (delay (track 'a 1)))").unwrap();
+        eval.eval_str("(define lazy-b (delay (track 'b 2)))").unwrap();
+        eval.eval_str("(define lazy-c (delay (track 'c 3)))").unwrap();
+        
+        // Nothing computed yet
+        assert_eq!(eval_to_string(&lisp, &mut eval, "computed").unwrap(), "()");
+        
+        // Force only b
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-b)").unwrap(), "2");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "computed").unwrap(), "(b)");
+        
+        // Force a
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-a)").unwrap(), "1");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "computed").unwrap(), "(a b)");
+        
+        // Force b again (should not recompute)
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-b)").unwrap(), "2");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "computed").unwrap(), "(a b)");
+    }
+    
+    #[test]
+    fn test_thunk_lazy_if() {
+        let lisp: Lisp<2000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // A lazy-if that only evaluates the selected branch
+        eval.eval_str("(define side-effects '())").unwrap();
+        eval.eval_str("(define (track x) (set! side-effects (cons x side-effects)) x)").unwrap();
+        
+        eval.eval_str("(define (lazy-if cond then-thunk else-thunk) (force (if cond then-thunk else-thunk)))").unwrap();
+        
+        // Create thunks for branches
+        eval.eval_str("(define t-branch (delay (track 'then)))").unwrap();
+        eval.eval_str("(define e-branch (delay (track 'else)))").unwrap();
+        
+        // Only then should execute
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(lazy-if #t t-branch e-branch)").unwrap(), "then");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "side-effects").unwrap(), "(then)");
+        
+        // Create new thunks (old ones are memoized)
+        eval.eval_str("(define t-branch2 (delay (track 'then2)))").unwrap();
+        eval.eval_str("(define e-branch2 (delay (track 'else2)))").unwrap();
+        
+        // Only else should execute
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(lazy-if #f t-branch2 e-branch2)").unwrap(), "else2");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "side-effects").unwrap(), "(else2 then)");
+    }
+    
+    #[test]
+    fn test_thunk_in_list() {
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // List of thunks
+        eval.eval_str("(define thunk-list (list (delay 1) (delay 2) (delay 3)))").unwrap();
+        
+        // All elements are promises
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(promise? (car thunk-list))").unwrap(), "#t");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(promise? (car (cdr thunk-list)))").unwrap(), "#t");
+        
+        // Force them
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force (car thunk-list))").unwrap(), "1");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force (car (cdr thunk-list)))").unwrap(), "2");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force (car (cdr (cdr thunk-list))))").unwrap(), "3");
+    }
+    
+    #[test]
+    fn test_thunk_simple_stream() {
+        let lisp: Lisp<3000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Define stream operations
+        eval.eval_str("(define (stream-cons x s) (cons x (delay s)))").unwrap();
+        eval.eval_str("(define (stream-car s) (car s))").unwrap();
+        eval.eval_str("(define (stream-cdr s) (force (cdr s)))").unwrap();
+        
+        // Finite stream: (1 2 3)
+        eval.eval_str("(define s3 (stream-cons 3 '()))").unwrap();
+        eval.eval_str("(define s2 (stream-cons 2 s3))").unwrap();
+        eval.eval_str("(define s1 (stream-cons 1 s2))").unwrap();
+        
+        // Access elements lazily
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(stream-car s1)").unwrap(), "1");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(stream-car (stream-cdr s1))").unwrap(), "2");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(stream-car (stream-cdr (stream-cdr s1)))").unwrap(), "3");
+    }
+    
+    #[test]
+    fn test_thunk_cyclic_stream() {
+        let lisp: Lisp<3000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Stream utilities
+        eval.eval_str("(define (stream-cons x s) (cons x (delay s)))").unwrap();
+        eval.eval_str("(define (stream-car s) (car s))").unwrap();
+        eval.eval_str("(define (stream-cdr s) (force (cdr s)))").unwrap();
+        
+        // Create a cyclic stream using mutation
+        eval.eval_str("(define ones (cons 1 #f))").unwrap();
+        eval.eval_str("(set-cdr! ones (delay ones))").unwrap();
+        
+        // Access elements - cyclic so always 1
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(stream-car ones)").unwrap(), "1");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(stream-car (stream-cdr ones))").unwrap(), "1");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(stream-car (stream-cdr (stream-cdr ones)))").unwrap(), "1");
+    }
+    
+    #[test]
+    fn test_thunk_format_display() {
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Unforced thunk displays as promise
+        eval.eval_str("(define p (delay 42))").unwrap();
+        let unforced = eval_to_string(&lisp, &mut eval, "p").unwrap();
+        assert!(unforced.contains("promise"));
+        
+        // Force it
+        eval.eval_str("(force p)").unwrap();
+        
+        // Forced thunk might display differently (implementation detail)
+        // But promise? should still return true
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(promise? p)").unwrap(), "#t");
+    }
+    
+    #[test]
     fn test_nil_is_truthy() {
         let lisp: Lisp<1000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
