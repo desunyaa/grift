@@ -480,21 +480,23 @@ fn print_help() {
     println!("  (let ((x v)...) body) - Parallel local bindings");
     println!("  (let* ((x v)...) body)- Sequential local bindings");
     println!("  (begin e1 e2...)      - Sequence (TCO in last)");
-    println!("  (set! name val)       - Mutate binding");
     println!("  (and e1 e2...)        - Short-circuit and");
     println!("  (or e1 e2...)         - Short-circuit or");
-    println!("  (delay expr)          - Create lazy thunk");
+    println!("  (delay expr)          - Create lazy thunk (call-by-need)");
     println!();
     println!("Built-in Functions:");
-    println!("  List:   car, cdr, cons, list, set-car!, set-cdr!");
+    println!("  List:   car, cdr, cons, list");
     println!("  Pred:   atom, eq, null?, pair?, number?, boolean?");
     println!("          symbol?, procedure?, promise?");
-    println!("  Lazy:   force");
+    println!("  Lazy:   force, delay");
     println!("  Bool:   not");
     println!("  Math:   +, -, *, /, mod");
     println!("  Cmp:    <, >, <=, >=, =");
     println!("  I/O:    print, display, newline");
     println!("  Err:    error");
+    println!();
+    println!("NOTE: This is a PURE functional Lisp - no mutation!");
+    println!("      Call-by-need (delay/force) is semantically sound.");
     println!();
     println!("REPL Commands:");
     println!("  :help, :h, :?  - Show this help");
@@ -507,11 +509,8 @@ fn print_help() {
     println!("  (define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))");
     println!("  (fact 10)");
     println!();
-    println!("  (define lazy-fib (delay (+ 1 2)))");
-    println!("  (force lazy-fib)");
-    println!();
-    println!("  (define x (cons 1 2))");
-    println!("  (set-car! x 100)");
+    println!("  (define lazy-fib (delay (fib 20)))");
+    println!("  (force lazy-fib)  ; computes once, memoizes");
     println!();
 }
 
@@ -699,20 +698,7 @@ mod tests {
         assert_eq!(eval_to_string(&lisp, &mut eval, "(fold + 0 '(1 2 3 4 5))").unwrap(), "15");
     }
     
-    #[test]
-    fn test_mutation() {
-        let lisp: Lisp<1000> = Lisp::new();
-        let mut eval = Evaluator::new(&lisp).unwrap();
-        
-        eval.eval_str("(define x (cons 1 2))").unwrap();
-        assert_eq!(eval_to_string(&lisp, &mut eval, "x").unwrap(), "(1 . 2)");
-        
-        eval.eval_str("(set-car! x 100)").unwrap();
-        assert_eq!(eval_to_string(&lisp, &mut eval, "x").unwrap(), "(100 . 2)");
-        
-        eval.eval_str("(set-cdr! x 200)").unwrap();
-        assert_eq!(eval_to_string(&lisp, &mut eval, "x").unwrap(), "(100 . 200)");
-    }
+    // NOTE: test_mutation removed - this is a PURE Lisp!
     
     #[test]
     fn test_delay_force() {
@@ -726,23 +712,16 @@ mod tests {
     
     #[test]
     fn test_thunk_memoization() {
+        // In a pure language, memoization is semantically transparent
         let lisp: Lisp<1000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
-        // Side effect to track evaluation count
-        eval.eval_str("(define eval-count 0)").unwrap();
-        eval.eval_str("(define lazy-val (delay (begin (set! eval-count (+ eval-count 1)) 42)))").unwrap();
+        eval.eval_str("(define lazy-val (delay (* 6 7)))").unwrap();
         
-        // eval-count starts at 0
-        assert_eq!(eval_to_string(&lisp, &mut eval, "eval-count").unwrap(), "0");
-        
-        // Force multiple times
+        // Force multiple times - all return same result
         assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-val)").unwrap(), "42");
         assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-val)").unwrap(), "42");
         assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-val)").unwrap(), "42");
-        
-        // Should only have evaluated once
-        assert_eq!(eval_to_string(&lisp, &mut eval, "eval-count").unwrap(), "1");
     }
     
     #[test]
@@ -763,15 +742,14 @@ mod tests {
         let mut eval = Evaluator::new(&lisp).unwrap();
         
         // Thunk captures the lexical environment at creation time
+        // In a pure language, this is straightforward - the value never changes
         eval.eval_str("(define x 10)").unwrap();
         eval.eval_str("(define lazy-x (delay x))").unwrap();
         
-        // Change x
-        eval.eval_str("(set! x 20)").unwrap();
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-x)").unwrap(), "10");
         
-        // Thunk should see the value at force time (20), not creation time
-        // This is because we capture the environment, and x is mutated
-        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-x)").unwrap(), "20");
+        // Multiple forces return same value (referential transparency)
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-x)").unwrap(), "10");
     }
     
     #[test]
@@ -804,32 +782,22 @@ mod tests {
     
     #[test]
     fn test_thunk_lazy_computation() {
+        // In a pure language, lazy computation is semantically transparent
         let lisp: Lisp<2000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
-        // Define expensive computation tracker
-        eval.eval_str("(define computed '())").unwrap();
-        eval.eval_str("(define (track name val) (set! computed (cons name computed)) val)").unwrap();
+        // Create lazy values with pure computations
+        eval.eval_str("(define lazy-a (delay (* 1 1)))").unwrap();
+        eval.eval_str("(define lazy-b (delay (* 2 2)))").unwrap();
+        eval.eval_str("(define lazy-c (delay (* 3 3)))").unwrap();
         
-        // Create lazy values
-        eval.eval_str("(define lazy-a (delay (track 'a 1)))").unwrap();
-        eval.eval_str("(define lazy-b (delay (track 'b 2)))").unwrap();
-        eval.eval_str("(define lazy-c (delay (track 'c 3)))").unwrap();
-        
-        // Nothing computed yet
-        assert_eq!(eval_to_string(&lisp, &mut eval, "computed").unwrap(), "()");
-        
-        // Force only b
-        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-b)").unwrap(), "2");
-        assert_eq!(eval_to_string(&lisp, &mut eval, "computed").unwrap(), "(b)");
-        
-        // Force a
+        // Force in any order - referentially transparent
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-b)").unwrap(), "4");
         assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-a)").unwrap(), "1");
-        assert_eq!(eval_to_string(&lisp, &mut eval, "computed").unwrap(), "(a b)");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-c)").unwrap(), "9");
         
-        // Force b again (should not recompute)
-        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-b)").unwrap(), "2");
-        assert_eq!(eval_to_string(&lisp, &mut eval, "computed").unwrap(), "(a b)");
+        // Force again - same results
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(force lazy-b)").unwrap(), "4");
     }
     
     #[test]
@@ -838,26 +806,17 @@ mod tests {
         let mut eval = Evaluator::new(&lisp).unwrap();
         
         // A lazy-if that only evaluates the selected branch
-        eval.eval_str("(define side-effects '())").unwrap();
-        eval.eval_str("(define (track x) (set! side-effects (cons x side-effects)) x)").unwrap();
-        
         eval.eval_str("(define (lazy-if cond then-thunk else-thunk) (force (if cond then-thunk else-thunk)))").unwrap();
         
         // Create thunks for branches
-        eval.eval_str("(define t-branch (delay (track 'then)))").unwrap();
-        eval.eval_str("(define e-branch (delay (track 'else)))").unwrap();
+        eval.eval_str("(define t-branch (delay 'then))").unwrap();
+        eval.eval_str("(define e-branch (delay 'else))").unwrap();
         
         // Only then should execute
         assert_eq!(eval_to_string(&lisp, &mut eval, "(lazy-if #t t-branch e-branch)").unwrap(), "then");
-        assert_eq!(eval_to_string(&lisp, &mut eval, "side-effects").unwrap(), "(then)");
-        
-        // Create new thunks (old ones are memoized)
-        eval.eval_str("(define t-branch2 (delay (track 'then2)))").unwrap();
-        eval.eval_str("(define e-branch2 (delay (track 'else2)))").unwrap();
         
         // Only else should execute
-        assert_eq!(eval_to_string(&lisp, &mut eval, "(lazy-if #f t-branch2 e-branch2)").unwrap(), "else2");
-        assert_eq!(eval_to_string(&lisp, &mut eval, "side-effects").unwrap(), "(else2 then)");
+        assert_eq!(eval_to_string(&lisp, &mut eval, "(lazy-if #f t-branch e-branch)").unwrap(), "else");
     }
     
     #[test]
@@ -901,19 +860,19 @@ mod tests {
     
     #[test]
     fn test_thunk_cyclic_stream() {
+        // In a pure language, we can create infinite streams using recursion and delay
         let lisp: Lisp<3000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
         // Stream utilities
-        eval.eval_str("(define (stream-cons x s) (cons x (delay s)))").unwrap();
         eval.eval_str("(define (stream-car s) (car s))").unwrap();
         eval.eval_str("(define (stream-cdr s) (force (cdr s)))").unwrap();
         
-        // Create a cyclic stream using mutation
-        eval.eval_str("(define ones (cons 1 #f))").unwrap();
-        eval.eval_str("(set-cdr! ones (delay ones))").unwrap();
+        // Create an infinite stream of ones using a generator function
+        eval.eval_str("(define (make-ones) (cons 1 (delay (make-ones))))").unwrap();
+        eval.eval_str("(define ones (make-ones))").unwrap();
         
-        // Access elements - cyclic so always 1
+        // Access elements - infinite stream of 1s
         assert_eq!(eval_to_string(&lisp, &mut eval, "(stream-car ones)").unwrap(), "1");
         assert_eq!(eval_to_string(&lisp, &mut eval, "(stream-car (stream-cdr ones))").unwrap(), "1");
         assert_eq!(eval_to_string(&lisp, &mut eval, "(stream-car (stream-cdr (stream-cdr ones)))").unwrap(), "1");

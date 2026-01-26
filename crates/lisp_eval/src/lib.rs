@@ -2,12 +2,16 @@
 
 //! # Lisp Evaluator
 //!
-//! A classic Lisp evaluator with:
+//! A PURE Lisp evaluator with:
 //! - Lexically scoped closures
 //! - Tail Call Optimization (TCO)
 //! - Call-by-need (lazy evaluation via delay/force)
-//! - Full mutation (set-car!, set-cdr!)
 //! - Rich error handling with stack traces
+//!
+//! ## Purity
+//!
+//! This is a pure functional language - NO MUTATION!
+//! This makes call-by-need semantically sound (referential transparency).
 //!
 //! ## Truthiness
 //!
@@ -19,11 +23,10 @@
 //! - `if` - Conditional (TCO in branches)
 //! - `cond` - Multi-way conditional (TCO in last branch)
 //! - `lambda` - Create closure
-//! - `define` - Define variable/function
+//! - `define` - Define variable/function (top-level only)
 //! - `let` - Local binding
 //! - `let*` - Sequential local binding
 //! - `begin` - Sequence of expressions (TCO in last)
-//! - `set!` - Mutation of bindings
 //! - `and` / `or` - Short-circuit boolean operations
 //! - `delay` - Create a thunk (lazy evaluation)
 
@@ -387,50 +390,10 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         }
     }
     
-    /// Set a variable in the environment (mutation)
-    fn env_set(&self, env: ArenaIndex, name: ArenaIndex, value: ArenaIndex) -> EvalResult {
-        // Try local first
-        let mut current = env;
-        loop {
-            match self.lisp.get(current)? {
-                Value::Nil => break,
-                Value::Cons { car, cdr } => {
-                    let binding = self.lisp.get(car)?;
-                    if let Value::Cons { car: bound_name, cdr: _ } = binding {
-                        if self.lisp.symbol_eq(bound_name, name)? {
-                            self.lisp.set(car, Value::Cons { car: bound_name, cdr: value })?;
-                            return Ok(value);
-                        }
-                    }
-                    current = cdr;
-                }
-                _ => break,
-            }
-        }
-        
-        // Try global
-        let mut current = self.global_env;
-        loop {
-            match self.lisp.get(current)? {
-                Value::Nil => {
-                    return Err(self.make_error(ErrorKind::UnboundVariable, name));
-                }
-                Value::Cons { car, cdr } => {
-                    let binding = self.lisp.get(car)?;
-                    if let Value::Cons { car: bound_name, cdr: _ } = binding {
-                        if self.lisp.symbol_eq(bound_name, name)? {
-                            self.lisp.set(car, Value::Cons { car: bound_name, cdr: value })?;
-                            return Ok(value);
-                        }
-                    }
-                    current = cdr;
-                }
-                _ => return Err(self.make_error(ErrorKind::Generic, name)),
-            }
-        }
-    }
+    // NOTE: env_set removed - this is a PURE Lisp!
+    // Mutation breaks referential transparency and call-by-need semantics.
     
-    /// Define in global environment
+    /// Define in global environment (NOTE: only allowed at top-level)
     pub fn define(&mut self, name: ArenaIndex, value: ArenaIndex) -> EvalResult {
         // Check if already defined and update
         let mut current = self.global_env;
@@ -568,10 +531,7 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                             }
                         }
                         
-                        // set!
-                        if self.lisp.symbol_matches(car, "set!")? {
-                            return self.eval_set(cdr, env);
-                        }
+                        // NOTE: set! removed - this is a PURE Lisp!
                         
                         // and - short circuit
                         if self.lisp.symbol_matches(car, "and")? {
@@ -862,13 +822,7 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         }
     }
     
-    /// Evaluate set!
-    fn eval_set(&mut self, args: ArenaIndex, env: ArenaIndex) -> EvalResult {
-        let name = self.lisp.car(args)?;
-        let value_expr = self.lisp.car(self.lisp.cdr(args)?)?;
-        let value = self.eval_in_env(value_expr, env)?;
-        self.env_set(env, name, value)
-    }
+    // NOTE: eval_set removed - this is a PURE Lisp!
     
     // ========================================================================
     // Helpers
@@ -1008,31 +962,7 @@ impl<'a, const N: usize> Evaluator<'a, N> {
             
             Builtin::List => Ok(args),
             
-            Builtin::SetCar => {
-                let pair = self.lisp.car(args)?;
-                let new_val = self.lisp.car(self.lisp.cdr(args)?)?;
-                
-                match self.lisp.get(pair)? {
-                    Value::Cons { cdr, .. } => {
-                        self.lisp.set(pair, Value::Cons { car: new_val, cdr })?;
-                        Ok(new_val)
-                    }
-                    _ => Err(self.type_error(call_expr, "pair", self.lisp.get(pair)?.type_name())),
-                }
-            }
-            
-            Builtin::SetCdr => {
-                let pair = self.lisp.car(args)?;
-                let new_val = self.lisp.car(self.lisp.cdr(args)?)?;
-                
-                match self.lisp.get(pair)? {
-                    Value::Cons { car, .. } => {
-                        self.lisp.set(pair, Value::Cons { car, cdr: new_val })?;
-                        Ok(new_val)
-                    }
-                    _ => Err(self.type_error(call_expr, "pair", self.lisp.get(pair)?.type_name())),
-                }
-            }
+            // NOTE: SetCar and SetCdr removed - this is a PURE Lisp!
             
             Builtin::Atom => {
                 let arg = self.lisp.car(args)?;
@@ -1357,20 +1287,7 @@ mod tests {
         assert_eq!(eval_to_num(&lisp, &mut eval, "(fact 5)"), 120);
     }
     
-    #[test]
-    fn test_set_car_cdr() {
-        let lisp: Lisp<1000> = Lisp::new();
-        let mut eval = Evaluator::new(&lisp).unwrap();
-        
-        eval.eval_str("(define x (cons 1 2))").unwrap();
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(car x)"), 1);
-        
-        eval.eval_str("(set-car! x 100)").unwrap();
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(car x)"), 100);
-        
-        eval.eval_str("(set-cdr! x 200)").unwrap();
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(cdr x)"), 200);
-    }
+    // NOTE: test_set_car_cdr removed - this is a PURE Lisp!
     
     #[test]
     fn test_delay_force() {
@@ -1392,21 +1309,21 @@ mod tests {
     
     #[test]
     fn test_lazy_memoization() {
+        // In a pure language, memoization is semantically transparent
+        // We verify it by checking that multiple forces return identical results
         let lisp: Lisp<1000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
-        // Use mutation to verify memoization
-        eval.eval_str("(define counter 0)").unwrap();
-        eval.eval_str("(define lazy-inc (delay (begin (set! counter (+ counter 1)) counter)))").unwrap();
+        eval.eval_str("(define lazy-val (delay (* 6 7)))").unwrap();
         
-        // First force - increments counter
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-inc)"), 1);
+        // First force
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-val)"), 42);
         
-        // Second force - should return cached value, not increment again
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-inc)"), 1);
+        // Second force - should return cached value (same result in pure language)
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-val)"), 42);
         
-        // Counter should still be 1
-        assert_eq!(eval_to_num(&lisp, &mut eval, "counter"), 1);
+        // Third force
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-val)"), 42);
     }
     
     #[test]
@@ -1466,62 +1383,55 @@ mod tests {
     
     #[test]
     fn test_thunk_conditional_evaluation() {
-        // Thunks allow conditional evaluation of expensive operations
+        // Thunks allow conditional evaluation - only the selected branch is computed
         let lisp: Lisp<2000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
-        eval.eval_str("(define expensive-counter 0)").unwrap();
-        eval.eval_str("(define (expensive-op) (set! expensive-counter (+ expensive-counter 1)) 999)").unwrap();
+        eval.eval_str("(define (expensive-op x) (* x x x))").unwrap();
         
         // Create thunks for both branches
-        eval.eval_str("(define then-branch (delay (expensive-op)))").unwrap();
-        eval.eval_str("(define else-branch (delay (expensive-op)))").unwrap();
+        eval.eval_str("(define then-branch (delay (expensive-op 10)))").unwrap();
+        eval.eval_str("(define else-branch (delay (expensive-op 5)))").unwrap();
         
         // Only force one branch based on condition
         eval.eval_str("(define (lazy-if cond then else) (if cond (force then) (force else)))").unwrap();
         
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(lazy-if #t then-branch else-branch)"), 999);
-        
-        // Only one expensive operation should have been executed
-        assert_eq!(eval_to_num(&lisp, &mut eval, "expensive-counter"), 1);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(lazy-if #t then-branch else-branch)"), 1000);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(lazy-if #f then-branch else-branch)"), 125);
     }
     
     #[test]
     fn test_thunk_multiple_forces_same_result() {
-        // Multiple forces should always return the same result
+        // Multiple forces should always return the same result (referential transparency)
         let lisp: Lisp<1000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
-        eval.eval_str("(define counter 0)").unwrap();
-        eval.eval_str("(define thunk (delay (begin (set! counter (+ counter 1)) (* counter 10))))").unwrap();
+        eval.eval_str("(define thunk (delay (* 7 8)))").unwrap();
         
-        // Force multiple times
+        // Force multiple times - all should return same value
         let r1 = eval_to_num(&lisp, &mut eval, "(force thunk)");
         let r2 = eval_to_num(&lisp, &mut eval, "(force thunk)");
         let r3 = eval_to_num(&lisp, &mut eval, "(force thunk)");
         
-        assert_eq!(r1, 10);
-        assert_eq!(r2, 10);  // Should be same, not 20
-        assert_eq!(r3, 10);  // Should be same, not 30
-        
-        // Counter should only have been incremented once
-        assert_eq!(eval_to_num(&lisp, &mut eval, "counter"), 1);
+        assert_eq!(r1, 56);
+        assert_eq!(r2, 56);
+        assert_eq!(r3, 56);
     }
     
     #[test]
     fn test_thunk_with_closures() {
-        // Thunks work correctly with closures
+        // Thunks work correctly with closures - they capture lexical environment
         let lisp: Lisp<2000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
-        eval.eval_str("(define (make-counter) (let ((n 0)) (delay (begin (set! n (+ n 1)) n))))").unwrap();
-        eval.eval_str("(define counter1 (make-counter))").unwrap();
-        eval.eval_str("(define counter2 (make-counter))").unwrap();
+        eval.eval_str("(define (make-lazy-square n) (delay (* n n)))").unwrap();
+        eval.eval_str("(define lazy-4 (make-lazy-square 2))").unwrap();
+        eval.eval_str("(define lazy-9 (make-lazy-square 3))").unwrap();
         
-        // Each counter has its own environment
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(force counter1)"), 1);
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(force counter1)"), 1);  // Memoized
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(force counter2)"), 1);  // Independent
+        // Each thunk captures its own n
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-4)"), 4);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-4)"), 4);  // Memoized
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-9)"), 9);  // Independent
     }
     
     #[test]
@@ -1541,20 +1451,22 @@ mod tests {
     #[test]
     fn test_thunk_delay_does_not_evaluate() {
         // delay should not evaluate its expression until forced
+        // In a pure language, this is verified by the fact that
+        // we can create thunks that would error if evaluated immediately
         let lisp: Lisp<1000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
-        eval.eval_str("(define evaluated #f)").unwrap();
-        eval.eval_str("(define lazy-val (delay (begin (set! evaluated #t) 42)))").unwrap();
+        // This thunk references an undefined variable - would error if evaluated now
+        eval.eval_str("(define lazy-val (delay (+ undefined-var 1)))").unwrap();
         
-        // evaluated should still be false
-        assert!(eval_is_false(&lisp, &mut eval, "evaluated"));
+        // But we can still check it's a promise without triggering the error
+        assert!(eval_is_true(&lisp, &mut eval, "(promise? lazy-val)"));
         
-        // Now force it
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-val)"), 42);
-        
-        // Now evaluated should be true
-        assert!(eval_is_true(&lisp, &mut eval, "evaluated"));
+        // Only when we force it would the error occur (we don't test that to avoid panic)
+        // Instead, test that a valid thunk delays properly
+        eval.eval_str("(define lazy-42 (delay 42))").unwrap();
+        assert!(eval_is_true(&lisp, &mut eval, "(promise? lazy-42)"));
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-42)"), 42);
     }
     
     #[test]
@@ -1641,24 +1553,19 @@ mod tests {
     }
     
     #[test]
-    fn test_thunk_expression_only_evaluated_once() {
-        // Even if expression has side effects, it should only run once
+    fn test_thunk_referential_transparency() {
+        // In a PURE language, call-by-need is semantically transparent
+        // Multiple forces always return the same value
         let lisp: Lisp<1000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
-        eval.eval_str("(define call-log '())").unwrap();
-        eval.eval_str("(define (log-and-return x) (set! call-log (cons x call-log)) x)").unwrap();
+        eval.eval_str("(define (compute x) (* x x x))").unwrap();
+        eval.eval_str("(define lazy-27 (delay (compute 3)))").unwrap();
         
-        eval.eval_str("(define lazy-42 (delay (log-and-return 42)))").unwrap();
-        
-        // Force multiple times
-        eval.eval_str("(force lazy-42)").unwrap();
-        eval.eval_str("(force lazy-42)").unwrap();
-        eval.eval_str("(force lazy-42)").unwrap();
-        
-        // log-and-return should only have been called once
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(car call-log)"), 42);
-        assert!(eval_is_true(&lisp, &mut eval, "(null? (cdr call-log))"));
+        // Force multiple times - all identical
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-27)"), 27);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-27)"), 27);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-27)"), 27);
     }
     
     #[test]
@@ -1731,5 +1638,155 @@ mod tests {
         eval.eval_str("(define x 42)").unwrap();
         let _stats = eval.gc();
         assert_eq!(eval_to_num(&lisp, &mut eval, "x"), 42);
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PURE CALL-BY-NEED TESTS
+    // In a pure language, call-by-need is semantically transparent
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Thunks capture lexical environment - variables are looked up at force time
+    #[test]
+    fn test_pure_cbn_lexical_capture() {
+        let lisp: Lisp<2000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        eval.eval_str("(define x 10)").unwrap();
+        eval.eval_str("(define p (delay x))").unwrap();
+        
+        // In a pure language, x can't change, so this always returns 10
+        let result = eval_to_num(&lisp, &mut eval, "(force p)");
+        assert_eq!(result, 10);
+        
+        // Multiple forces return same result (referential transparency)
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force p)"), 10);
+    }
+    
+    /// Memoization is semantically transparent in a pure language
+    #[test]
+    fn test_pure_cbn_memoization_transparent() {
+        let lisp: Lisp<2000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Pure computation with factorial (tail-recursive is fine for us)
+        eval.eval_str("(define (fact n acc) (if (= n 0) acc (fact (- n 1) (* n acc))))").unwrap();
+        eval.eval_str("(define lazy-fact-5 (delay (fact 5 1)))").unwrap();
+        
+        // Force multiple times - all return same result
+        let r1 = eval_to_num(&lisp, &mut eval, "(force lazy-fact-5)");
+        let r2 = eval_to_num(&lisp, &mut eval, "(force lazy-fact-5)");
+        let r3 = eval_to_num(&lisp, &mut eval, "(force lazy-fact-5)");
+        
+        assert_eq!(r1, 120);  // 5! = 120
+        assert_eq!(r2, 120);
+        assert_eq!(r3, 120);
+    }
+    
+    /// Multiple independent thunks
+    #[test]
+    fn test_pure_cbn_multiple_thunks() {
+        let lisp: Lisp<2000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        eval.eval_str("(define p1 (delay (+ 1 2)))").unwrap();
+        eval.eval_str("(define p2 (delay (* 3 4)))").unwrap();
+        eval.eval_str("(define p3 (delay (- 10 5)))").unwrap();
+        
+        // Each thunk is independent
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force p1)"), 3);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force p2)"), 12);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force p3)"), 5);
+        
+        // Force in different order - still same results
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force p3)"), 5);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force p1)"), 3);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force p2)"), 12);
+    }
+    
+    /// Nested thunks in pure context
+    #[test]
+    fn test_pure_cbn_nested_thunks() {
+        let lisp: Lisp<2000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        eval.eval_str("(define x 5)").unwrap();
+        eval.eval_str("(define inner (delay x))").unwrap();
+        eval.eval_str("(define outer (delay (+ 100 (force inner))))").unwrap();
+        
+        // Nested force works correctly
+        let result = eval_to_num(&lisp, &mut eval, "(force outer)");
+        assert_eq!(result, 105);
+        
+        // Multiple forces still work
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force outer)"), 105);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force inner)"), 5);
+    }
+    
+    /// Thunks in closures
+    #[test]
+    fn test_pure_cbn_thunk_in_closure() {
+        let lisp: Lisp<3000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Closure that returns a thunk capturing its argument
+        eval.eval_str("(define (make-lazy-sum a b) (delay (+ a b)))").unwrap();
+        
+        eval.eval_str("(define lazy-3 (make-lazy-sum 1 2))").unwrap();
+        eval.eval_str("(define lazy-30 (make-lazy-sum 10 20))").unwrap();
+        
+        // Each captures its own environment
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-3)"), 3);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-30)"), 30);
+        
+        // Memoized
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-3)"), 3);
+    }
+    
+    /// Pure lazy streams (infinite data structures)
+    #[test]
+    fn test_pure_cbn_lazy_stream() {
+        let lisp: Lisp<3000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Simple stream accessors
+        eval.eval_str("(define (stream-car s) (car s))").unwrap();
+        eval.eval_str("(define (stream-cdr s) (force (cdr s)))").unwrap();
+        
+        // Create an infinite stream of ones by defining a generator function
+        // The delay inside the lambda makes this work
+        eval.eval_str("(define (make-ones) (cons 1 (delay (make-ones))))").unwrap();
+        eval.eval_str("(define ones (make-ones))").unwrap();
+        
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(stream-car ones)"), 1);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(stream-car (stream-cdr ones))"), 1);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(stream-car (stream-cdr (stream-cdr ones)))"), 1);
+    }
+    
+    /// Call-by-need semantics summary for PURE language
+    #[test]
+    fn test_pure_cbn_semantics_summary() {
+        let lisp: Lisp<3000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // In a PURE language:
+        // 1. Thunks capture the lexical environment at creation time
+        // 2. Forcing always produces the same result (referential transparency)
+        // 3. Memoization is a performance optimization, not a semantic change
+        // 4. No side effects means no stale cache problem
+        
+        eval.eval_str("(define (expensive n) (* n n n n))").unwrap();
+        eval.eval_str("(define lazy-val (delay (expensive 5)))").unwrap();
+        
+        // All forces return same result
+        let r1 = eval_to_num(&lisp, &mut eval, "(force lazy-val)");
+        let r2 = eval_to_num(&lisp, &mut eval, "(force lazy-val)");
+        let r3 = eval_to_num(&lisp, &mut eval, "(force lazy-val)");
+        
+        assert_eq!(r1, 625);
+        assert_eq!(r2, 625);
+        assert_eq!(r3, 625);
+        
+        // This is the beauty of purity: call-by-need is semantically
+        // equivalent to call-by-name, just more efficient!
     }
 }

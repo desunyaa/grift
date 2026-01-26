@@ -359,11 +359,7 @@ fn main() {
     println!("Section 4: Closures & Environments");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let _ = eval_str(
-        &lisp,
-        &mut eval,
-        "(define (make-counter) (let ((n 0)) (lambda () (set! n (+ n 1)) n)))",
-    );
+    // Pure closure - no mutation
     let _ = eval_str(
         &lisp,
         &mut eval,
@@ -451,50 +447,13 @@ fn main() {
     eval.gc();
     println!();
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // SECTION 6: Mutation
-    // ═══════════════════════════════════════════════════════════════════════
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("Section 6: Mutation (set!, set-car!, set-cdr!)");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-    // set! test - simplified
-    let _ = eval_str(&lisp, &mut eval, "(define mut-var 0)");
-    results.push(run_bench(
-        "set! expression x 100",
-        &lisp,
-        &mut eval,
-        100,
-        "(begin (set! mut-var (+ mut-var 1)) mut-var)",
-        None, // Don't check result - it changes each time
-    ));
-
-    // set-car!/set-cdr! test - simplified
-    results.push(run_bench(
-        "set-car! x 100",
-        &lisp,
-        &mut eval,
-        100,
-        "(let ((p (cons 1 2))) (set-car! p 10) (car p))",
-        Some("10"),
-    ));
-
-    results.push(run_bench(
-        "set-cdr! x 100",
-        &lisp,
-        &mut eval,
-        100,
-        "(let ((p (cons 1 2))) (set-cdr! p 20) (cdr p))",
-        Some("20"),
-    ));
-
-    println!();
+    // NOTE: Mutation section removed - this is a PURE Lisp!
 
     // ═══════════════════════════════════════════════════════════════════════
-    // SECTION 7: Garbage Collection
+    // SECTION 6: Garbage Collection
     // ═══════════════════════════════════════════════════════════════════════
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("Section 7: Garbage Collection");
+    println!("Section 6: Garbage Collection");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     // GC stress test: allocate lots, then collect
@@ -532,7 +491,7 @@ fn main() {
     // SECTION 8: Parsing Stress
     // ═══════════════════════════════════════════════════════════════════════
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("Section 8: Parsing");
+    println!("Section 7: Parsing");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     results.push(run_bench(

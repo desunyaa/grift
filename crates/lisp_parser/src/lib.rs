@@ -28,15 +28,16 @@
 pub use pwn_arena::{Arena, ArenaIndex, ArenaError, ArenaResult, Trace, GcStats};
 
 /// Built-in functions (optimization to avoid symbol lookup)
+/// 
+/// NOTE: This is a PURE Lisp - no mutation operations!
+/// This makes call-by-need semantically sound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Builtin {
-    // List operations
+    // List operations (pure)
     Car,
     Cdr,
     Cons,
     List,
-    SetCar,  // Mutation!
-    SetCdr,  // Mutation!
     
     // Predicates
     Atom,
@@ -48,7 +49,7 @@ pub enum Builtin {
     Procedurep,
     Symbolp,
     
-    // Lazy evaluation
+    // Lazy evaluation (call-by-need)
     Force,
     Promisep,
     
@@ -86,8 +87,6 @@ impl Builtin {
             Builtin::Cdr => "cdr",
             Builtin::Cons => "cons",
             Builtin::List => "list",
-            Builtin::SetCar => "set-car!",
-            Builtin::SetCdr => "set-cdr!",
             Builtin::Atom => "atom",
             Builtin::Eq => "eq",
             Builtin::Null => "null?",
@@ -119,7 +118,6 @@ impl Builtin {
     /// All builtins for initialization
     pub const ALL: &'static [Builtin] = &[
         Builtin::Car, Builtin::Cdr, Builtin::Cons, Builtin::List,
-        Builtin::SetCar, Builtin::SetCdr,
         Builtin::Atom, Builtin::Eq, Builtin::Null, Builtin::Pairp,
         Builtin::Numberp, Builtin::Booleanp, Builtin::Procedurep, Builtin::Symbolp,
         Builtin::Force, Builtin::Promisep,
@@ -418,25 +416,8 @@ impl<const N: usize> Lisp<N> {
         }
     }
     
-    /// Set car of a cons cell (mutation!)
-    pub fn set_car(&self, index: ArenaIndex, new_car: ArenaIndex) -> ArenaResult<()> {
-        match self.get(index)? {
-            Value::Cons { cdr, .. } => {
-                self.set(index, Value::Cons { car: new_car, cdr })
-            }
-            _ => Err(ArenaError::InvalidIndex),
-        }
-    }
-    
-    /// Set cdr of a cons cell (mutation!)
-    pub fn set_cdr(&self, index: ArenaIndex, new_cdr: ArenaIndex) -> ArenaResult<()> {
-        match self.get(index)? {
-            Value::Cons { car, .. } => {
-                self.set(index, Value::Cons { car, cdr: new_cdr })
-            }
-            _ => Err(ArenaError::InvalidIndex),
-        }
-    }
+    // NOTE: set_car and set_cdr removed - this is a PURE Lisp!
+    // Mutation breaks referential transparency and call-by-need semantics.
     
     /// Create a symbol from a string slice (builds char list)
     pub fn symbol(&self, name: &str) -> ArenaResult<ArenaIndex> {
@@ -1085,23 +1066,7 @@ mod tests {
         assert!(!lisp.symbol_eq(a, c).unwrap());
     }
     
-    #[test]
-    fn test_set_car_cdr() {
-        let lisp: Lisp<100> = Lisp::new();
-        
-        let a = lisp.number(1).unwrap();
-        let b = lisp.number(2).unwrap();
-        let c = lisp.number(3).unwrap();
-        let pair = lisp.cons(a, b).unwrap();
-        
-        // Mutate car
-        lisp.set_car(pair, c).unwrap();
-        assert_eq!(lisp.get(lisp.car(pair).unwrap()).unwrap(), Value::Number(3));
-        
-        // Mutate cdr
-        lisp.set_cdr(pair, a).unwrap();
-        assert_eq!(lisp.get(lisp.cdr(pair).unwrap()).unwrap(), Value::Number(1));
-    }
+    // NOTE: test_set_car_cdr removed - this is a PURE Lisp!
     
     #[test]
     fn test_gc() {
