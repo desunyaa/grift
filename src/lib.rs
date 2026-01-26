@@ -66,6 +66,15 @@ pub struct ArenaIndex {
 }
 
 impl ArenaIndex {
+    /// A sentinel "null" index that is never valid.
+    ///
+    /// This can be used as a placeholder when an optional index is needed
+    /// but `Option<ArenaIndex>` is not desired.
+    pub const NULL: ArenaIndex = ArenaIndex {
+        index: usize::MAX,
+        generation: u32::MAX,
+    };
+
     /// Create a new arena index with the given slot index and generation.
     ///
     /// # Warning
@@ -90,6 +99,19 @@ impl ArenaIndex {
     pub const fn generation(self) -> u32 {
         self.generation
     }
+
+    /// Check if this is the null index.
+    #[inline]
+    pub const fn is_null(self) -> bool {
+        self.index == usize::MAX && self.generation == u32::MAX
+    }
+}
+
+impl Default for ArenaIndex {
+    /// Returns [`ArenaIndex::NULL`].
+    fn default() -> Self {
+        Self::NULL
+    }
 }
 
 /// Errors that can occur during arena operations.
@@ -104,6 +126,27 @@ pub enum ArenaError {
     /// The index's generation doesn't match the slot's current generation.
     /// This indicates a use-after-free attempt (ABA problem).
     GenerationMismatch,
+}
+
+impl ArenaError {
+    /// Get a human-readable description of the error.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            ArenaError::OutOfMemory => "arena is full",
+            ArenaError::InvalidIndex => "invalid index",
+            ArenaError::GenerationMismatch => "stale index (generation mismatch)",
+        }
+    }
+
+    /// Check if this error indicates the arena is full.
+    pub const fn is_out_of_memory(&self) -> bool {
+        matches!(self, ArenaError::OutOfMemory)
+    }
+
+    /// Check if this error indicates an invalid or stale index.
+    pub const fn is_invalid_index(&self) -> bool {
+        matches!(self, ArenaError::InvalidIndex | ArenaError::GenerationMismatch)
+    }
 }
 
 /// Result type for arena operations.
@@ -420,6 +463,94 @@ impl<T: Copy, const N: usize> Arena<T, N> {
         Ok(())
     }
 
+    /// Modify a value in place using a closure.
+    ///
+    /// This is more efficient than `get` + `set` as it avoids copying the value twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ArenaError::InvalidIndex` if the index is out of bounds or not allocated.
+    /// Returns `ArenaError::GenerationMismatch` if the index is stale.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use pwn_arena::Arena;
+    ///
+    /// let arena: Arena<i32, 10> = Arena::new(0);
+    /// let idx = arena.alloc(42).unwrap();
+    ///
+    /// arena.modify(idx, |v| *v += 10).unwrap();
+    /// assert_eq!(arena.get(idx).unwrap(), 52);
+    /// ```
+    pub fn modify<F>(&self, index: ArenaIndex, f: F) -> ArenaResult<()>
+    where
+        F: FnOnce(&mut T),
+    {
+        let idx = self.validate_index(index)?;
+
+        let mut slots = self.slots.borrow_mut();
+        if let Slot::Occupied { ref mut value } = slots[idx] {
+            f(value);
+            Ok(())
+        } else {
+            Err(ArenaError::InvalidIndex)
+        }
+    }
+
+    /// Get a value, returning `None` instead of an error if invalid.
+    ///
+    /// This is a convenience method for cases where you expect the index
+    /// might be invalid and want to handle it with `Option` instead of `Result`.
+    #[inline]
+    pub fn try_get(&self, index: ArenaIndex) -> Option<T> {
+        self.get(index).ok()
+    }
+
+    /// Swap the values at two indices.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either index is invalid.
+    pub fn swap(&self, a: ArenaIndex, b: ArenaIndex) -> ArenaResult<()> {
+        let idx_a = self.validate_index(a)?;
+        let idx_b = self.validate_index(b)?;
+
+        if idx_a == idx_b {
+            return Ok(()); // Same slot, nothing to do
+        }
+
+        let mut slots = self.slots.borrow_mut();
+
+        let (val_a, val_b) = match (&slots[idx_a], &slots[idx_b]) {
+            (Slot::Occupied { value: va }, Slot::Occupied { value: vb }) => (*va, *vb),
+            _ => return Err(ArenaError::InvalidIndex),
+        };
+
+        slots[idx_a] = Slot::Occupied { value: val_b };
+        slots[idx_b] = Slot::Occupied { value: val_a };
+
+        Ok(())
+    }
+
+    /// Replace the value at an index, returning the old value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index is invalid.
+    pub fn replace(&self, index: ArenaIndex, value: T) -> ArenaResult<T> {
+        let idx = self.validate_index(index)?;
+
+        let mut slots = self.slots.borrow_mut();
+        match slots[idx] {
+            Slot::Occupied { value: old } => {
+                slots[idx] = Slot::Occupied { value };
+                Ok(old)
+            }
+            Slot::Free { .. } => Err(ArenaError::InvalidIndex),
+        }
+    }
+
     /// Free a cell, making it available for reuse.
     ///
     /// This increments the slot's generation, invalidating any existing indices
@@ -550,6 +681,205 @@ impl<T: Copy, const N: usize> Arena<T, N> {
         } else {
             fragments as f32 / N as f32
         }
+    }
+
+    /// Validate internal consistency of the arena.
+    ///
+    /// Returns `true` if the arena's internal state is consistent.
+    /// This is useful for debugging and testing.
+    ///
+    /// Checks:
+    /// - Free list integrity (no cycles, correct length)
+    /// - Slot count matches `len`
+    /// - All free slots are in the free list
+    pub fn validate(&self) -> bool {
+        let slots = self.slots.borrow();
+        let free_head = *self.free_head.borrow();
+        let len = *self.len.borrow();
+
+        // Count occupied slots
+        let occupied_count = slots.iter().filter(|s| matches!(s, Slot::Occupied { .. })).count();
+        if occupied_count != len {
+            return false;
+        }
+
+        // Validate free list
+        let mut free_count = 0;
+        let mut visited = [false; N];
+        let mut current = free_head;
+
+        while current != FREE_LIST_END {
+            if current >= N {
+                return false; // Invalid index
+            }
+            if visited[current] {
+                return false; // Cycle detected
+            }
+            visited[current] = true;
+
+            match slots[current] {
+                Slot::Free { next_free } => {
+                    free_count += 1;
+                    current = next_free;
+                }
+                Slot::Occupied { .. } => {
+                    return false; // Free list points to occupied slot
+                }
+            }
+        }
+
+        // Check that free_count + occupied_count == N
+        if free_count + occupied_count != N {
+            return false;
+        }
+
+        // Check all free slots are in the free list
+        for (i, slot) in slots.iter().enumerate() {
+            if matches!(slot, Slot::Free { .. }) && !visited[i] {
+                return false; // Free slot not in free list
+            }
+        }
+
+        true
+    }
+
+    /// Get the generation counter for a slot (for debugging).
+    ///
+    /// Returns `None` if the index is out of bounds.
+    pub fn get_generation(&self, slot_index: usize) -> Option<u32> {
+        if slot_index < N {
+            Some(self.generations.borrow()[slot_index])
+        } else {
+            None
+        }
+    }
+
+    /// Check if a slot index is currently occupied (ignoring generation).
+    ///
+    /// This is a low-level debugging method. For normal use, prefer [`is_allocated`].
+    pub fn is_slot_occupied(&self, slot_index: usize) -> bool {
+        if slot_index >= N {
+            return false;
+        }
+        matches!(self.slots.borrow()[slot_index], Slot::Occupied { .. })
+    }
+
+    /// Get indices of all allocated slots.
+    ///
+    /// Returns an array with the first `len()` elements being valid indices.
+    /// The remaining elements are [`ArenaIndex::NULL`].
+    pub fn allocated_indices(&self) -> [ArenaIndex; N] {
+        let mut result = [ArenaIndex::NULL; N];
+        let mut count = 0;
+
+        let slots = self.slots.borrow();
+        let generations = self.generations.borrow();
+
+        for (idx, slot) in slots.iter().enumerate() {
+            if let Slot::Occupied { .. } = slot {
+                result[count] = ArenaIndex::new(idx, generations[idx]);
+                count += 1;
+            }
+        }
+
+        result
+    }
+
+    /// Apply a function to all allocated values.
+    ///
+    /// This is useful for bulk updates without the overhead of iteration.
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(ArenaIndex, &T),
+    {
+        let slots = self.slots.borrow();
+        let generations = self.generations.borrow();
+
+        for (idx, slot) in slots.iter().enumerate() {
+            if let Slot::Occupied { value } = slot {
+                f(ArenaIndex::new(idx, generations[idx]), value);
+            }
+        }
+    }
+
+    /// Apply a mutating function to all allocated values.
+    pub fn for_each_mut<F>(&self, mut f: F)
+    where
+        F: FnMut(ArenaIndex, &mut T),
+    {
+        let mut slots = self.slots.borrow_mut();
+        let generations = self.generations.borrow();
+
+        for (idx, slot) in slots.iter_mut().enumerate() {
+            if let Slot::Occupied { value } = slot {
+                f(ArenaIndex::new(idx, generations[idx]), value);
+            }
+        }
+    }
+
+    /// Count values matching a predicate.
+    pub fn count_where<F>(&self, predicate: F) -> usize
+    where
+        F: Fn(&T) -> bool,
+    {
+        let slots = self.slots.borrow();
+        slots
+            .iter()
+            .filter(|slot| {
+                if let Slot::Occupied { value } = slot {
+                    predicate(value)
+                } else {
+                    false
+                }
+            })
+            .count()
+    }
+
+    /// Find the first value matching a predicate.
+    pub fn find<F>(&self, predicate: F) -> Option<(ArenaIndex, T)>
+    where
+        F: Fn(&T) -> bool,
+    {
+        let slots = self.slots.borrow();
+        let generations = self.generations.borrow();
+
+        for (idx, slot) in slots.iter().enumerate() {
+            if let Slot::Occupied { value } = slot {
+                if predicate(value) {
+                    return Some((ArenaIndex::new(idx, generations[idx]), *value));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if any allocated value matches a predicate.
+    pub fn any<F>(&self, predicate: F) -> bool
+    where
+        F: Fn(&T) -> bool,
+    {
+        self.find(predicate).is_some()
+    }
+
+    /// Check if all allocated values match a predicate.
+    ///
+    /// Returns `true` if the arena is empty.
+    pub fn all<F>(&self, predicate: F) -> bool
+    where
+        F: Fn(&T) -> bool,
+    {
+        let slots = self.slots.borrow();
+
+        for slot in slots.iter() {
+            if let Slot::Occupied { value } = slot {
+                if !predicate(value) {
+                    return false;
+                }
+            }
+        }
+
+        true
     }
 }
 
@@ -718,7 +1048,7 @@ pub trait Trace<T: Copy, const N: usize> {
 }
 
 /// Statistics returned by garbage collection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GcStats {
     /// Number of objects that were marked as reachable.
     pub marked: usize,
@@ -728,6 +1058,42 @@ pub struct GcStats {
 
     /// Number of objects that existed before collection.
     pub total_before: usize,
+}
+
+impl GcStats {
+    /// Check if any garbage was collected.
+    #[inline]
+    pub const fn did_collect(&self) -> bool {
+        self.collected > 0
+    }
+
+    /// Get the number of objects remaining after collection.
+    #[inline]
+    pub const fn remaining(&self) -> usize {
+        self.total_before - self.collected
+    }
+
+    /// Get the collection ratio (0.0 to 1.0).
+    ///
+    /// Returns 0.0 if no objects existed before collection.
+    pub fn collection_ratio(&self) -> f32 {
+        if self.total_before == 0 {
+            0.0
+        } else {
+            self.collected as f32 / self.total_before as f32
+        }
+    }
+
+    /// Get the survival ratio (0.0 to 1.0).
+    ///
+    /// Returns 1.0 if no objects existed before collection.
+    pub fn survival_ratio(&self) -> f32 {
+        if self.total_before == 0 {
+            1.0
+        } else {
+            self.marked as f32 / self.total_before as f32
+        }
+    }
 }
 
 impl<T: Copy, const N: usize> Arena<T, N> {
@@ -831,37 +1197,59 @@ impl<T: Copy, const N: usize> Arena<T, N> {
             let current_idx = mark_stack[stack_len];
 
             let slots = self.slots.borrow();
-            let generations = self.generations.borrow();
 
             if let Slot::Occupied { value } = slots[current_idx] {
-                let current_gen = generations[current_idx];
                 drop(slots);
-                drop(generations);
 
-                // Collect children to mark (using a small temporary array)
-                // We trace into a temporary buffer to avoid borrow issues
-                let mut children = [0usize; 16]; // Most nodes have few children
-                let mut child_count = 0usize;
+                // Collect ALL children by processing in batches of 16
+                // This ensures we never silently drop children
+                let mut batch = [0usize; 16];
+                let mut batch_count = 0usize;
+                let mut overflow_detected = false;
 
                 value.trace(|child_index| {
-                    if child_count < 16 {
-                        let idx = child_index.raw();
-                        if idx < N && !marked[idx] {
-                            children[child_count] = idx;
-                            child_count += 1;
+                    let idx = child_index.raw();
+                    if idx < N && !marked[idx] {
+                        if batch_count < 16 {
+                            batch[batch_count] = idx;
+                            batch_count += 1;
+                        } else {
+                            overflow_detected = true;
                         }
                     }
                 });
 
-                // Now mark and push children
-                for i in 0..child_count {
-                    let idx = children[i];
+                // Process the batch
+                for i in 0..batch_count {
+                    let idx = batch[i];
                     if !marked[idx] && self.is_allocated(ArenaIndex::new(idx, self.generations.borrow()[idx])) {
                         marked[idx] = true;
                         if stack_len < N {
                             mark_stack[stack_len] = idx;
                             stack_len += 1;
                         }
+                    }
+                }
+
+                // If there were more than 16 children, re-trace to get the rest
+                // This is rare but ensures correctness
+                if overflow_detected {
+                    let slots = self.slots.borrow();
+                    if let Slot::Occupied { value } = slots[current_idx] {
+                        drop(slots);
+
+                        value.trace(|child_index| {
+                            let idx = child_index.raw();
+                            if idx < N && !marked[idx] {
+                                if self.is_allocated(ArenaIndex::new(idx, self.generations.borrow()[idx])) {
+                                    marked[idx] = true;
+                                    if stack_len < N {
+                                        mark_stack[stack_len] = idx;
+                                        stack_len += 1;
+                                    }
+                                }
+                            }
+                        });
                     }
                 }
             }
@@ -999,7 +1387,7 @@ impl<T: Copy, const N: usize> Arena<T, N> {
             }
         }
 
-        // Process mark stack (same as collect_garbage)
+        // Process mark stack (same logic as collect_garbage with overflow handling)
         while stack_len > 0 {
             stack_len -= 1;
             let current_idx = mark_stack[stack_len];
@@ -1009,27 +1397,51 @@ impl<T: Copy, const N: usize> Arena<T, N> {
             if let Slot::Occupied { value } = slots[current_idx] {
                 drop(slots);
 
-                let mut children = [0usize; 16];
-                let mut child_count = 0usize;
+                let mut batch = [0usize; 16];
+                let mut batch_count = 0usize;
+                let mut overflow_detected = false;
 
                 value.trace(|child_index| {
-                    if child_count < 16 {
-                        let idx = child_index.raw();
-                        if idx < N && !marked[idx] {
-                            children[child_count] = idx;
-                            child_count += 1;
+                    let idx = child_index.raw();
+                    if idx < N && !marked[idx] {
+                        if batch_count < 16 {
+                            batch[batch_count] = idx;
+                            batch_count += 1;
+                        } else {
+                            overflow_detected = true;
                         }
                     }
                 });
 
-                for i in 0..child_count {
-                    let idx = children[i];
+                for i in 0..batch_count {
+                    let idx = batch[i];
                     if !marked[idx] && self.is_allocated(ArenaIndex::new(idx, self.generations.borrow()[idx])) {
                         marked[idx] = true;
                         if stack_len < N {
                             mark_stack[stack_len] = idx;
                             stack_len += 1;
                         }
+                    }
+                }
+
+                // Handle overflow case
+                if overflow_detected {
+                    let slots = self.slots.borrow();
+                    if let Slot::Occupied { value } = slots[current_idx] {
+                        drop(slots);
+
+                        value.trace(|child_index| {
+                            let idx = child_index.raw();
+                            if idx < N && !marked[idx] {
+                                if self.is_allocated(ArenaIndex::new(idx, self.generations.borrow()[idx])) {
+                                    marked[idx] = true;
+                                    if stack_len < N {
+                                        mark_stack[stack_len] = idx;
+                                        stack_len += 1;
+                                    }
+                                }
+                            }
+                        });
                     }
                 }
             }
@@ -1080,6 +1492,52 @@ impl<T: Copy, const N: usize> Arena<T, N> {
         self.set_gc_enabled(was_enabled);
         result
     }
+
+    /// Allocate a value, running GC first if the arena is full.
+    ///
+    /// If allocation fails due to `OutOfMemory`, this method runs garbage
+    /// collection with the provided roots and retries the allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OutOfMemory` if allocation still fails after GC.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use pwn_arena::{Arena, ArenaIndex, Trace};
+    ///
+    /// #[derive(Clone, Copy)]
+    /// struct Node(i32);
+    ///
+    /// impl<const N: usize> Trace<Node, N> for Node {
+    ///     fn trace<F: FnMut(ArenaIndex)>(&self, _: F) {}
+    /// }
+    ///
+    /// let arena: Arena<Node, 3> = Arena::new(Node(0));
+    ///
+    /// let root = arena.alloc(Node(1)).unwrap();
+    /// arena.alloc(Node(2)).unwrap(); // garbage
+    /// arena.alloc(Node(3)).unwrap(); // garbage
+    ///
+    /// // Arena is full, but alloc_or_gc will collect garbage first
+    /// let new_idx = arena.alloc_or_gc(Node(4), &[root]).unwrap();
+    /// assert_eq!(arena.len(), 2); // root + new_idx
+    /// ```
+    pub fn alloc_or_gc(&self, value: T, roots: &[ArenaIndex]) -> ArenaResult<ArenaIndex>
+    where
+        T: Trace<T, N>,
+    {
+        match self.alloc(value) {
+            Ok(idx) => Ok(idx),
+            Err(ArenaError::OutOfMemory) => {
+                // Run GC and retry
+                self.collect_garbage_forced(roots);
+                self.alloc(value)
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 // ============================================================================
@@ -1118,7 +1576,7 @@ impl<'a, T: Copy, const N: usize> Iterator for ArenaIterator<'a, T, N> {
 // ============================================================================
 
 /// Statistics about arena usage.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ArenaStats {
     /// Total capacity of the arena.
     pub capacity: usize,
@@ -1141,6 +1599,28 @@ impl ArenaStats {
         } else {
             (self.allocated as f32 / self.capacity as f32) * 100.0
         }
+    }
+
+    /// Get free space as a percentage (0-100).
+    pub fn free_percent(&self) -> f32 {
+        100.0 - self.usage_percent()
+    }
+
+    /// Check if the arena is empty.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.allocated == 0
+    }
+
+    /// Check if the arena is full.
+    #[inline]
+    pub const fn is_full(&self) -> bool {
+        self.free == 0
+    }
+
+    /// Check if fragmentation is above a threshold.
+    pub fn is_fragmented(&self, threshold: f32) -> bool {
+        self.fragmentation > threshold
     }
 }
 
