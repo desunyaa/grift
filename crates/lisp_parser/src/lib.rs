@@ -75,6 +75,9 @@ pub enum Builtin {
     
     // Error handling
     Error,
+    
+    // Memoization
+    Memoize,
 }
 
 impl Builtin {
@@ -108,6 +111,7 @@ impl Builtin {
             Builtin::Newline => "newline",
             Builtin::Display => "display",
             Builtin::Error => "error",
+            Builtin::Memoize => "memoize",
         }
     }
     
@@ -121,6 +125,7 @@ impl Builtin {
         Builtin::Not,
         Builtin::Print, Builtin::Newline, Builtin::Display,
         Builtin::Error,
+        Builtin::Memoize,
     ];
 }
 
@@ -166,6 +171,13 @@ pub enum Value {
         expr: ArenaIndex,    // Unevaluated expression
         env: ArenaIndex,     // Environment for evaluation
         cached: ArenaIndex,  // Cached result (NULL if not yet evaluated)
+    },
+    
+    /// Memoized function - caches results keyed by argument values
+    /// Created by (memoize fn), automatically caches return values
+    Memo {
+        func: ArenaIndex,    // The wrapped function (lambda or builtin)
+        cache: ArenaIndex,   // Cache: alist of (args . result) pairs
     },
     
     /// Built-in function (optimized)
@@ -234,16 +246,22 @@ impl Value {
         matches!(self, Value::Builtin(_))
     }
     
-    /// Check if this value is a procedure (lambda or builtin)
+    /// Check if this value is a procedure (lambda, builtin, or memoized function)
     #[inline]
     pub const fn is_procedure(&self) -> bool {
-        matches!(self, Value::Lambda { .. } | Value::Builtin(_))
+        matches!(self, Value::Lambda { .. } | Value::Builtin(_) | Value::Memo { .. })
     }
     
     /// Check if this value is a thunk (promise)
     #[inline]
     pub const fn is_thunk(&self) -> bool {
         matches!(self, Value::Thunk { .. })
+    }
+    
+    /// Check if this value is a memoized function
+    #[inline]
+    pub const fn is_memo(&self) -> bool {
+        matches!(self, Value::Memo { .. })
     }
     
     /// Get the number value if this is a number
@@ -275,6 +293,7 @@ impl Value {
             Value::Symbol { .. } => "symbol",
             Value::Lambda { .. } => "procedure",
             Value::Thunk { .. } => "promise",
+            Value::Memo { .. } => "memoized",
             Value::Builtin(_) => "procedure",
         }
     }
@@ -306,6 +325,10 @@ impl<const N: usize> Trace<Value, N> for Value {
                 if !cached.is_null() {
                     tracer(*cached);
                 }
+            }
+            Value::Memo { func, cache } => {
+                tracer(*func);
+                tracer(*cache);
             }
         }
     }
@@ -454,6 +477,11 @@ impl<const N: usize> Lisp<N> {
     /// Allocate a thunk (delayed computation)
     pub fn thunk(&self, expr: ArenaIndex, env: ArenaIndex) -> ArenaResult<ArenaIndex> {
         self.alloc(Value::Thunk { expr, env, cached: ArenaIndex::NULL })
+    }
+    
+    /// Create a memoized function (wraps a function with a cache)
+    pub fn memo(&self, func: ArenaIndex, cache: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        self.alloc(Value::Memo { func, cache })
     }
     
     /// Build a list from an iterator of indices

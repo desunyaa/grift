@@ -318,6 +318,14 @@ enum Cont {
     LambdaBindArg { remaining_exprs: ArenaIndex, eval_env: ArenaIndex,
                     remaining_params: ArenaIndex, body: ArenaIndex,
                     new_env: ArenaIndex, call_expr: ArenaIndex },
+    
+    /// After forcing memo args, look up cache and maybe call function
+    MemoCollectArg { remaining_exprs: ArenaIndex, eval_env: ArenaIndex,
+                     collected: ArenaIndex, memo_idx: ArenaIndex, 
+                     func: ArenaIndex, cache: ArenaIndex, call_expr: ArenaIndex },
+    
+    /// After calling memoized function, store result in cache
+    MemoCacheResult { memo_idx: ArenaIndex, args: ArenaIndex, cache: ArenaIndex },
 }
 
 /// Trampoline state - what we're currently doing
@@ -391,9 +399,186 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         self.global_env
     }
     
-    /// Run GC with current roots
+    /// Run GC with current roots (global env only - use gc_with_continuations during evaluation)
     pub fn gc(&self) -> GcStats {
         self.lisp.gc(&[self.global_env])
+    }
+    
+    /// Run GC during evaluation - marks continuation stack AND current state as roots
+    fn gc_with_state(&self, state: &TrampolineState) -> GcStats {
+        // Collect all roots: global env + current state + all ArenaIndex values in continuations
+        const MAX_ROOTS: usize = 512;
+        let mut roots = [ArenaIndex::NULL; MAX_ROOTS];
+        let mut root_count = 0;
+        
+        // Always include global env
+        roots[root_count] = self.global_env;
+        root_count += 1;
+        
+        // Include current state
+        match state {
+            TrampolineState::Eval { expr, env } => {
+                roots[root_count] = *expr; root_count += 1;
+                roots[root_count] = *env; root_count += 1;
+            }
+            TrampolineState::Force { idx } => {
+                roots[root_count] = *idx; root_count += 1;
+            }
+            TrampolineState::Return { val } => {
+                roots[root_count] = *val; root_count += 1;
+            }
+        }
+        
+        // Collect roots from all continuations
+        for i in 0..self.cont_depth {
+            if root_count >= MAX_ROOTS - 20 {
+                break; // Leave some room
+            }
+            
+            match self.cont_stack[i] {
+                Cont::Done | Cont::Force => {}
+                Cont::CacheThunk { thunk_idx, expr, env } => {
+                    roots[root_count] = thunk_idx; root_count += 1;
+                    roots[root_count] = expr; root_count += 1;
+                    roots[root_count] = env; root_count += 1;
+                }
+                Cont::ApplyForced { args_expr, env, call_expr } => {
+                    roots[root_count] = args_expr; root_count += 1;
+                    roots[root_count] = env; root_count += 1;
+                    roots[root_count] = call_expr; root_count += 1;
+                }
+                Cont::IfBranch { then_expr, else_expr, env } => {
+                    roots[root_count] = then_expr; root_count += 1;
+                    roots[root_count] = else_expr; root_count += 1;
+                    roots[root_count] = env; root_count += 1;
+                }
+                Cont::BuiltinForceArg { remaining_args, collected, call_expr, .. } => {
+                    roots[root_count] = remaining_args; root_count += 1;
+                    roots[root_count] = collected; root_count += 1;
+                    roots[root_count] = call_expr; root_count += 1;
+                }
+                Cont::BuiltinCarCdr { call_expr, .. } => {
+                    roots[root_count] = call_expr; root_count += 1;
+                }
+                Cont::BinaryBuiltinFirst { second_arg, call_expr, .. } => {
+                    roots[root_count] = second_arg; root_count += 1;
+                    roots[root_count] = call_expr; root_count += 1;
+                }
+                Cont::BinaryBuiltinSecond { first_val, call_expr, .. } => {
+                    roots[root_count] = first_val; root_count += 1;
+                    roots[root_count] = call_expr; root_count += 1;
+                }
+                Cont::LambdaFirstBind { param } => {
+                    roots[root_count] = param; root_count += 1;
+                }
+                Cont::LambdaBindArg { remaining_exprs, eval_env, remaining_params, body, new_env, call_expr } => {
+                    roots[root_count] = remaining_exprs; root_count += 1;
+                    roots[root_count] = eval_env; root_count += 1;
+                    roots[root_count] = remaining_params; root_count += 1;
+                    roots[root_count] = body; root_count += 1;
+                    roots[root_count] = new_env; root_count += 1;
+                    roots[root_count] = call_expr; root_count += 1;
+                }
+                Cont::MemoCollectArg { remaining_exprs, eval_env, collected, memo_idx, func, cache, call_expr } => {
+                    roots[root_count] = remaining_exprs; root_count += 1;
+                    roots[root_count] = eval_env; root_count += 1;
+                    roots[root_count] = collected; root_count += 1;
+                    roots[root_count] = memo_idx; root_count += 1;
+                    roots[root_count] = func; root_count += 1;
+                    roots[root_count] = cache; root_count += 1;
+                    roots[root_count] = call_expr; root_count += 1;
+                }
+                Cont::MemoCacheResult { memo_idx, args, cache } => {
+                    roots[root_count] = memo_idx; root_count += 1;
+                    roots[root_count] = args; root_count += 1;
+                    roots[root_count] = cache; root_count += 1;
+                }
+            }
+        }
+        
+        self.lisp.gc(&roots[..root_count])
+    }
+    
+    /// Run GC during evaluation - marks continuation stack items as roots (deprecated, use gc_with_state)
+    #[allow(dead_code)]
+    fn gc_with_continuations(&self) -> GcStats {
+        // Collect all roots: global env + all ArenaIndex values in continuations
+        const MAX_ROOTS: usize = 512;
+        let mut roots = [ArenaIndex::NULL; MAX_ROOTS];
+        let mut root_count = 0;
+        
+        // Always include global env
+        roots[root_count] = self.global_env;
+        root_count += 1;
+        
+        // Collect roots from all continuations
+        for i in 0..self.cont_depth {
+            if root_count >= MAX_ROOTS - 20 {
+                break; // Leave some room
+            }
+            
+            match self.cont_stack[i] {
+                Cont::Done | Cont::Force => {}
+                Cont::CacheThunk { thunk_idx, expr, env } => {
+                    roots[root_count] = thunk_idx; root_count += 1;
+                    roots[root_count] = expr; root_count += 1;
+                    roots[root_count] = env; root_count += 1;
+                }
+                Cont::ApplyForced { args_expr, env, call_expr } => {
+                    roots[root_count] = args_expr; root_count += 1;
+                    roots[root_count] = env; root_count += 1;
+                    roots[root_count] = call_expr; root_count += 1;
+                }
+                Cont::IfBranch { then_expr, else_expr, env } => {
+                    roots[root_count] = then_expr; root_count += 1;
+                    roots[root_count] = else_expr; root_count += 1;
+                    roots[root_count] = env; root_count += 1;
+                }
+                Cont::BuiltinForceArg { remaining_args, collected, call_expr, .. } => {
+                    roots[root_count] = remaining_args; root_count += 1;
+                    roots[root_count] = collected; root_count += 1;
+                    roots[root_count] = call_expr; root_count += 1;
+                }
+                Cont::BuiltinCarCdr { call_expr, .. } => {
+                    roots[root_count] = call_expr; root_count += 1;
+                }
+                Cont::BinaryBuiltinFirst { second_arg, call_expr, .. } => {
+                    roots[root_count] = second_arg; root_count += 1;
+                    roots[root_count] = call_expr; root_count += 1;
+                }
+                Cont::BinaryBuiltinSecond { first_val, call_expr, .. } => {
+                    roots[root_count] = first_val; root_count += 1;
+                    roots[root_count] = call_expr; root_count += 1;
+                }
+                Cont::LambdaFirstBind { param } => {
+                    roots[root_count] = param; root_count += 1;
+                }
+                Cont::LambdaBindArg { remaining_exprs, eval_env, remaining_params, body, new_env, call_expr } => {
+                    roots[root_count] = remaining_exprs; root_count += 1;
+                    roots[root_count] = eval_env; root_count += 1;
+                    roots[root_count] = remaining_params; root_count += 1;
+                    roots[root_count] = body; root_count += 1;
+                    roots[root_count] = new_env; root_count += 1;
+                    roots[root_count] = call_expr; root_count += 1;
+                }
+                Cont::MemoCollectArg { remaining_exprs, eval_env, collected, memo_idx, func, cache, call_expr } => {
+                    roots[root_count] = remaining_exprs; root_count += 1;
+                    roots[root_count] = eval_env; root_count += 1;
+                    roots[root_count] = collected; root_count += 1;
+                    roots[root_count] = memo_idx; root_count += 1;
+                    roots[root_count] = func; root_count += 1;
+                    roots[root_count] = cache; root_count += 1;
+                    roots[root_count] = call_expr; root_count += 1;
+                }
+                Cont::MemoCacheResult { memo_idx, args, cache } => {
+                    roots[root_count] = memo_idx; root_count += 1;
+                    roots[root_count] = args; root_count += 1;
+                    roots[root_count] = cache; root_count += 1;
+                }
+            }
+        }
+        
+        self.lisp.gc(&roots[..root_count])
     }
     
     // ========================================================================
@@ -566,7 +751,23 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     /// The main trampoline loop - processes states and continuations
     /// This is the ONLY place where looping happens - no Rust recursion!
     fn trampoline(&mut self, mut state: TrampolineState) -> EvalResult {
+        // Counter for periodic GC checks (every 2000 steps)
+        let mut step_count: u32 = 0;
+        const GC_CHECK_INTERVAL: u32 = 2000;
+        const GC_THRESHOLD_PERCENT: usize = 85;
+        
         loop {
+            // Aggressive GC: Check memory usage periodically
+            step_count = step_count.wrapping_add(1);
+            if step_count % GC_CHECK_INTERVAL == 0 {
+                let stats = self.lisp.stats();
+                let usage_percent = (stats.allocated * 100) / stats.capacity;
+                if usage_percent >= GC_THRESHOLD_PERCENT {
+                    // Memory is getting full - run GC (marking continuations AND current state as roots)
+                    self.gc_with_state(&state);
+                }
+            }
+            
             state = match state {
                 TrampolineState::Eval { expr, env } => {
                     self.step_eval(expr, env)?
@@ -592,7 +793,8 @@ impl<'a, const N: usize> Evaluator<'a, N> {
             // Self-evaluating values
             Value::Nil | Value::True | Value::False | 
             Value::Number(_) | Value::Char(_) | 
-            Value::Builtin(_) | Value::Lambda { .. } | Value::Thunk { .. } => {
+            Value::Builtin(_) | Value::Lambda { .. } | Value::Thunk { .. } |
+            Value::Memo { .. } => {
                 Ok(TrampolineState::Return { val: expr })
             }
             
@@ -828,6 +1030,38 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                             Ok(Some(TrampolineState::Eval { expr: first_expr, env }))
                         }
                     }
+                    Value::Memo { func, cache } => {
+                        // Memoized function: evaluate args strictly, look up cache
+                        self.pop_frame();
+                        
+                        if self.lisp.get(args_expr)?.is_nil() {
+                            // No args - look up in cache with nil key
+                            let nil = self.lisp.nil()?;
+                            if let Some(cached_result) = self.memo_cache_lookup(cache, nil)? {
+                                Ok(Some(TrampolineState::Return { val: cached_result }))
+                            } else {
+                                // Call underlying function and cache result
+                                self.push_cont(Cont::MemoCacheResult { memo_idx: val, args: nil, cache })?;
+                                // Apply the wrapped function
+                                self.push_cont(Cont::ApplyForced { args_expr, env, call_expr })?;
+                                self.push_cont(Cont::Force)?;
+                                Ok(Some(TrampolineState::Return { val: func }))
+                            }
+                        } else {
+                            // Start collecting forced args for cache key
+                            let first_expr = self.lisp.car(args_expr)?;
+                            let rest_exprs = self.lisp.cdr(args_expr)?;
+                            let nil = self.lisp.nil()?;
+                            
+                            self.push_cont(Cont::MemoCollectArg {
+                                remaining_exprs: rest_exprs, eval_env: env,
+                                collected: nil, memo_idx: val, func, cache, call_expr
+                            })?;
+                            self.push_cont(Cont::Force)?;
+                            
+                            Ok(Some(TrampolineState::Eval { expr: first_expr, env }))
+                        }
+                    }
                     _ => {
                         self.pop_frame();
                         Err(self.type_error(call_expr, "procedure", self.lisp.get(val)?.type_name()))
@@ -883,6 +1117,64 @@ impl<'a, const N: usize> Evaluator<'a, N> {
             Cont::LambdaBindArg { .. } => {
                 // This shouldn't be hit directly - LambdaFirstBind pops it
                 Err(self.make_error(ErrorKind::Generic, val))
+            }
+            
+            Cont::MemoCollectArg { remaining_exprs, eval_env, collected, memo_idx, func, cache, call_expr } => {
+                // val is a forced argument for memoized function
+                let new_collected = self.lisp.cons(val, collected)?;
+                
+                if self.lisp.get(remaining_exprs)?.is_nil() {
+                    // All args collected - reverse and look up in cache
+                    let args = self.reverse_list(new_collected)?;
+                    
+                    if let Some(cached_result) = self.memo_cache_lookup(cache, args)? {
+                        // Cache hit!
+                        Ok(Some(TrampolineState::Return { val: cached_result }))
+                    } else {
+                        // Cache miss - call underlying function and cache result
+                        self.push_cont(Cont::MemoCacheResult { memo_idx, args, cache })?;
+                        
+                        // Apply the wrapped function with the collected args
+                        // We need to call it like a normal function application
+                        match self.lisp.get(func)? {
+                            Value::Lambda { params, body, env: closure_env } => {
+                                let new_env = self.bind_params(params, args, closure_env, call_expr)?;
+                                Ok(Some(TrampolineState::Eval { expr: body, env: new_env }))
+                            }
+                            Value::Builtin(b) => {
+                                let result = self.apply_builtin_with_forced_args(b, args, call_expr)?;
+                                Ok(Some(TrampolineState::Return { val: result }))
+                            }
+                            _ => Err(self.type_error(call_expr, "procedure", self.lisp.get(func)?.type_name())),
+                        }
+                    }
+                } else {
+                    // More args to force
+                    let next_expr = self.lisp.car(remaining_exprs)?;
+                    let rest_exprs = self.lisp.cdr(remaining_exprs)?;
+                    
+                    self.push_cont(Cont::MemoCollectArg {
+                        remaining_exprs: rest_exprs, eval_env,
+                        collected: new_collected, memo_idx, func, cache, call_expr
+                    })?;
+                    self.push_cont(Cont::Force)?;
+                    
+                    Ok(Some(TrampolineState::Eval { expr: next_expr, env: eval_env }))
+                }
+            }
+            
+            Cont::MemoCacheResult { memo_idx, args, cache } => {
+                // val is the result of calling the memoized function
+                // Store it in the cache
+                let new_entry = self.lisp.cons(args, val)?;
+                let new_cache = self.lisp.cons(new_entry, cache)?;
+                
+                // Update the memo value with the new cache
+                if let Value::Memo { func, .. } = self.lisp.get(memo_idx)? {
+                    self.lisp.set(memo_idx, Value::Memo { func, cache: new_cache })?;
+                }
+                
+                Ok(Some(TrampolineState::Return { val }))
             }
             
             Cont::BuiltinForceArg { builtin, remaining_args, collected, call_expr } => {
@@ -952,6 +1244,57 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                 }
                 _ => return Err(self.make_error(ErrorKind::TypeError, list)),
             }
+        }
+    }
+    
+    /// Look up args in memo cache (alist of (args . result) pairs)
+    /// Returns Some(result) if found, None if not found
+    fn memo_cache_lookup(&self, cache: ArenaIndex, args: ArenaIndex) -> Result<Option<ArenaIndex>, EvalError> {
+        let mut current = cache;
+        loop {
+            match self.lisp.get(current)? {
+                Value::Nil => return Ok(None), // Not found
+                Value::Cons { car, cdr } => {
+                    // car should be (cached_args . cached_result)
+                    if let Value::Cons { car: cached_args, cdr: cached_result } = self.lisp.get(car)? {
+                        if self.values_equal(args, cached_args)? {
+                            return Ok(Some(cached_result));
+                        }
+                    }
+                    current = cdr;
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+    
+    /// Check if two values are structurally equal (for memo cache lookup)
+    fn values_equal(&self, a: ArenaIndex, b: ArenaIndex) -> Result<bool, EvalError> {
+        if a == b {
+            return Ok(true);
+        }
+        
+        let val_a = self.lisp.get(a)?;
+        let val_b = self.lisp.get(b)?;
+        
+        match (val_a, val_b) {
+            (Value::Nil, Value::Nil) => Ok(true),
+            (Value::True, Value::True) => Ok(true),
+            (Value::False, Value::False) => Ok(true),
+            (Value::Number(x), Value::Number(y)) => Ok(x == y),
+            (Value::Char(x), Value::Char(y)) => Ok(x == y),
+            (Value::Symbol { .. }, Value::Symbol { .. }) => {
+                self.lisp.symbol_eq(a, b).map_err(Into::into)
+            }
+            (Value::Cons { car: car_a, cdr: cdr_a }, Value::Cons { car: car_b, cdr: cdr_b }) => {
+                // Recursively compare (limited depth to avoid stack overflow)
+                if self.values_equal(car_a, car_b)? {
+                    self.values_equal(cdr_a, cdr_b)
+                } else {
+                    Ok(false)
+                }
+            }
+            _ => Ok(false),
         }
     }
     
@@ -1164,6 +1507,20 @@ impl<'a, const N: usize> Evaluator<'a, N> {
             Builtin::Error => {
                 let msg = self.lisp.car(args)?;
                 Err(self.make_error(ErrorKind::UserError, msg))
+            }
+            
+            Builtin::Memoize => {
+                // (memoize fn) - wrap a function with memoization
+                let func = self.lisp.car(args)?;
+                
+                // Verify it's a procedure
+                if !self.lisp.get(func)?.is_procedure() {
+                    return Err(self.type_error(call_expr, "procedure", self.lisp.get(func)?.type_name()));
+                }
+                
+                // Create memo wrapper with empty cache
+                let nil = self.lisp.nil()?;
+                self.lisp.memo(func, nil).map_err(Into::into)
             }
         }
     }

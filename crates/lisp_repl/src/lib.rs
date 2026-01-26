@@ -85,6 +85,9 @@ fn format_value_impl<const N: usize>(
             buf.push_str(b.name());
             buf.push('>');
         }
+        Ok(Value::Memo { .. }) => {
+            buf.push_str("#<memoized>");
+        }
         Err(_) => buf.push_str("#<error>"),
     }
 }
