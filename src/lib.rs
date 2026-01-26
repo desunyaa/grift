@@ -11,6 +11,8 @@
 //! - **Generic**: Works with any `Copy` type
 //! - **Interior mutability**: Safe concurrent access via `RefCell`
 //! - **Zero dependencies**: Only uses `RefCell`
+//! - **Generational indices**: Detects use-after-free (ABA problem)
+//! - **O(1) allocation**: Free-list based allocation and deallocation
 //!
 //! ## Example
 //!
@@ -45,36 +47,34 @@ use core::cell::RefCell;
 // Types
 // ============================================================================
 
-/// Index into the arena.
+/// Index into the arena with generational tracking.
 ///
-/// This is a type-safe wrapper around `usize` to prevent mixing indices
-/// from different arenas or using raw integers accidentally.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ArenaIndex(usize);
+/// This is a type-safe wrapper that stores both the slot index and the
+/// generation at which it was allocated. This prevents the ABA problem
+/// where a freed and reallocated slot could be accessed by a stale index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ArenaIndex {
+    index: usize,
+    generation: u32,
+}
 
 impl ArenaIndex {
-    /// Create a new arena index.
+    /// Create a new arena index with the given slot index and generation.
     #[inline]
-    pub const fn new(index: usize) -> Self {
-        ArenaIndex(index)
+    pub const fn new(index: usize, generation: u32) -> Self {
+        ArenaIndex { index, generation }
     }
 
-    /// Get the raw index value.
+    /// Get the raw slot index value.
     #[inline]
     pub const fn raw(self) -> usize {
-        self.0
+        self.index
     }
-}
 
-impl From<usize> for ArenaIndex {
-    fn from(index: usize) -> Self {
-        ArenaIndex(index)
-    }
-}
-
-impl From<ArenaIndex> for usize {
-    fn from(index: ArenaIndex) -> Self {
-        index.0
+    /// Get the generation this index was created with.
+    #[inline]
+    pub const fn generation(self) -> u32 {
+        self.generation
     }
 }
 
@@ -84,18 +84,41 @@ pub enum ArenaError {
     /// Arena is full, cannot allocate more cells.
     OutOfMemory,
 
-    /// Invalid index (out of bounds or not allocated).
+    /// Invalid index (out of bounds, not allocated, or stale generation).
     InvalidIndex,
+
+    /// The index's generation doesn't match the slot's current generation.
+    /// This indicates a use-after-free attempt (ABA problem).
+    GenerationMismatch,
 }
 
 /// Result type for arena operations.
 pub type ArenaResult<T> = Result<T, ArenaError>;
 
 // ============================================================================
+// Slot Implementation (Free-List Support)
+// ============================================================================
+
+/// Sentinel value indicating end of free list.
+const FREE_LIST_END: usize = usize::MAX;
+
+/// Internal slot representation for free-list based allocation.
+///
+/// Each slot is either free (storing the next free slot index) or
+/// occupied (storing the actual value).
+#[derive(Clone, Copy)]
+enum Slot<T: Copy> {
+    /// Free slot containing index of the next free slot (or FREE_LIST_END).
+    Free { next_free: usize },
+    /// Occupied slot containing the stored value.
+    Occupied { value: T },
+}
+
+// ============================================================================
 // Arena Implementation
 // ============================================================================
 
-/// Fixed-size arena allocator.
+/// Fixed-size arena allocator with generational indices and O(1) allocation.
 ///
 /// # Type Parameters
 ///
@@ -104,23 +127,32 @@ pub type ArenaResult<T> = Result<T, ArenaError>;
 ///
 /// # Memory Layout
 ///
-/// - `cells`: Array of `T` values
-/// - `allocated`: Bitmap tracking which cells are in use
-/// - `next_free`: Hint for next free cell (optimization)
+/// - `slots`: Array of `Slot<T>` (either free with next pointer, or occupied with value)
+/// - `generations`: Array of generation counters for each slot
+/// - `free_head`: Head of the free list
+/// - `len`: Number of currently allocated slots
 ///
-/// # Size
+/// # Generational Indices
 ///
-/// For type `T` and capacity `N`: `N * sizeof(T) + N * 1 + 8` bytes
+/// Each slot has a generation counter that increments when freed. An `ArenaIndex`
+/// stores the generation it was created with. If generations don't match during
+/// access, `InvalidIndex` is returned, preventing the ABA problem.
+///
+/// # O(1) Allocation
+///
+/// Uses a free-list for constant-time allocation and deallocation instead of
+/// scanning a bitmap.
 pub struct Arena<T: Copy, const N: usize> {
-    cells: RefCell<[T; N]>,
-    allocated: RefCell<[bool; N]>,
-    next_free: RefCell<usize>,
+    slots: RefCell<[Slot<T>; N]>,
+    generations: RefCell<[u32; N]>,
+    free_head: RefCell<usize>,
+    len: RefCell<usize>,
 }
 
 impl<T: Copy, const N: usize> Arena<T, N> {
     /// Create a new arena.
     ///
-    /// All cells are initialized to `default_value`.
+    /// All slots start as free, linked together in a free list.
     ///
     /// # Example
     ///
@@ -129,11 +161,21 @@ impl<T: Copy, const N: usize> Arena<T, N> {
     ///
     /// let arena: Arena<i32, 100> = Arena::new(0);
     /// ```
-    pub const fn new(default_value: T) -> Self {
+    pub fn new(_default_value: T) -> Self {
+        // Initialize all slots as free, linked together
+        // Slot 0 -> 1 -> 2 -> ... -> N-1 -> FREE_LIST_END
+        let mut slots = [Slot::Free { next_free: FREE_LIST_END }; N];
+        for i in 0..N {
+            slots[i] = Slot::Free {
+                next_free: if i + 1 < N { i + 1 } else { FREE_LIST_END },
+            };
+        }
+
         Arena {
-            cells: RefCell::new([default_value; N]),
-            allocated: RefCell::new([false; N]),
-            next_free: RefCell::new(0),
+            slots: RefCell::new(slots),
+            generations: RefCell::new([0u32; N]),
+            free_head: RefCell::new(if N > 0 { 0 } else { FREE_LIST_END }),
+            len: RefCell::new(0),
         }
     }
 
@@ -144,8 +186,9 @@ impl<T: Copy, const N: usize> Arena<T, N> {
     }
 
     /// Get the number of currently allocated cells.
+    #[inline]
     pub fn len(&self) -> usize {
-        self.allocated.borrow().iter().filter(|&&x| x).count()
+        *self.len.borrow()
     }
 
     /// Check if the arena is empty (no allocated cells).
@@ -168,7 +211,7 @@ impl<T: Copy, const N: usize> Arena<T, N> {
 
     /// Allocate a new cell and return its index.
     ///
-    /// Uses a simple first-fit strategy with a hint for the next free cell.
+    /// Uses O(1) free-list based allocation.
     ///
     /// # Errors
     ///
@@ -184,25 +227,55 @@ impl<T: Copy, const N: usize> Arena<T, N> {
     /// assert_eq!(arena.get(idx).unwrap(), 42);
     /// ```
     pub fn alloc(&self, value: T) -> ArenaResult<ArenaIndex> {
-        let mut allocated = self.allocated.borrow_mut();
-        let mut cells = self.cells.borrow_mut();
-        let mut next_free = self.next_free.borrow_mut();
+        let mut free_head = self.free_head.borrow_mut();
 
-        // Start search from hint
-        for i in 0..N {
-            let idx = (*next_free + i) % N;
-            if !allocated[idx] {
-                cells[idx] = value;
-                allocated[idx] = true;
-
-                // Update hint to next position
-                *next_free = (idx + 1) % N;
-
-                return Ok(ArenaIndex::new(idx));
-            }
+        // Check if there's a free slot
+        if *free_head == FREE_LIST_END {
+            return Err(ArenaError::OutOfMemory);
         }
 
-        Err(ArenaError::OutOfMemory)
+        let idx = *free_head;
+        let mut slots = self.slots.borrow_mut();
+
+        // Pop from free list
+        let next_free = match slots[idx] {
+            Slot::Free { next_free } => next_free,
+            Slot::Occupied { .. } => unreachable!("free_head pointed to occupied slot"),
+        };
+
+        // Mark as occupied
+        slots[idx] = Slot::Occupied { value };
+        *free_head = next_free;
+
+        // Get current generation for this slot
+        let generation = self.generations.borrow()[idx];
+
+        // Increment allocated count
+        *self.len.borrow_mut() += 1;
+
+        Ok(ArenaIndex::new(idx, generation))
+    }
+
+    /// Validate an index and return the slot index if valid.
+    #[inline]
+    fn validate_index(&self, index: ArenaIndex) -> ArenaResult<usize> {
+        let idx = index.raw();
+
+        if idx >= N {
+            return Err(ArenaError::InvalidIndex);
+        }
+
+        // Check generation
+        let current_gen = self.generations.borrow()[idx];
+        if index.generation() != current_gen {
+            return Err(ArenaError::GenerationMismatch);
+        }
+
+        // Check if slot is occupied
+        match self.slots.borrow()[idx] {
+            Slot::Occupied { .. } => Ok(idx),
+            Slot::Free { .. } => Err(ArenaError::InvalidIndex),
+        }
     }
 
     /// Get a copy of the value at the given index.
@@ -210,19 +283,14 @@ impl<T: Copy, const N: usize> Arena<T, N> {
     /// # Errors
     ///
     /// Returns `ArenaError::InvalidIndex` if the index is out of bounds or not allocated.
+    /// Returns `ArenaError::GenerationMismatch` if the index is stale (slot was freed and reused).
     pub fn get(&self, index: ArenaIndex) -> ArenaResult<T> {
-        let idx = index.raw();
+        let idx = self.validate_index(index)?;
 
-        if idx >= N {
-            return Err(ArenaError::InvalidIndex);
+        match self.slots.borrow()[idx] {
+            Slot::Occupied { value } => Ok(value),
+            Slot::Free { .. } => Err(ArenaError::InvalidIndex),
         }
-
-        let allocated = self.allocated.borrow();
-        if !allocated[idx] {
-            return Err(ArenaError::InvalidIndex);
-        }
-
-        Ok(self.cells.borrow()[idx])
     }
 
     /// Set the value at the given index.
@@ -230,28 +298,23 @@ impl<T: Copy, const N: usize> Arena<T, N> {
     /// # Errors
     ///
     /// Returns `ArenaError::InvalidIndex` if the index is out of bounds or not allocated.
+    /// Returns `ArenaError::GenerationMismatch` if the index is stale.
     pub fn set(&self, index: ArenaIndex, value: T) -> ArenaResult<()> {
-        let idx = index.raw();
+        let idx = self.validate_index(index)?;
 
-        if idx >= N {
-            return Err(ArenaError::InvalidIndex);
-        }
-
-        let allocated = self.allocated.borrow();
-        if !allocated[idx] {
-            return Err(ArenaError::InvalidIndex);
-        }
-        drop(allocated);
-
-        self.cells.borrow_mut()[idx] = value;
+        self.slots.borrow_mut()[idx] = Slot::Occupied { value };
         Ok(())
     }
 
     /// Free a cell, making it available for reuse.
     ///
+    /// This increments the slot's generation, invalidating any existing indices
+    /// to this slot.
+    ///
     /// # Errors
     ///
     /// Returns `ArenaError::InvalidIndex` if the index is out of bounds or not allocated.
+    /// Returns `ArenaError::GenerationMismatch` if the index is stale.
     ///
     /// # Example
     ///
@@ -264,36 +327,55 @@ impl<T: Copy, const N: usize> Arena<T, N> {
     /// assert_eq!(arena.len(), 0);
     /// ```
     pub fn free(&self, index: ArenaIndex) -> ArenaResult<()> {
-        let idx = index.raw();
+        let idx = self.validate_index(index)?;
 
-        if idx >= N {
-            return Err(ArenaError::InvalidIndex);
+        // Increment generation to invalidate any existing indices
+        {
+            let mut generations = self.generations.borrow_mut();
+            generations[idx] = generations[idx].wrapping_add(1);
         }
 
-        let mut allocated = self.allocated.borrow_mut();
-        if !allocated[idx] {
-            return Err(ArenaError::InvalidIndex);
-        }
+        // Push onto free list
+        let mut free_head = self.free_head.borrow_mut();
+        self.slots.borrow_mut()[idx] = Slot::Free { next_free: *free_head };
+        *free_head = idx;
 
-        allocated[idx] = false;
+        // Decrement allocated count
+        *self.len.borrow_mut() -= 1;
+
         Ok(())
     }
 
-    /// Check if an index is currently allocated.
+    /// Check if an index is currently valid (allocated with matching generation).
     #[inline]
     pub fn is_allocated(&self, index: ArenaIndex) -> bool {
-        let idx = index.raw();
-        idx < N && self.allocated.borrow()[idx]
+        self.validate_index(index).is_ok()
     }
 
     /// Clear all allocations, making the entire arena available.
+    ///
+    /// This increments all generations to invalidate existing indices.
     ///
     /// # Warning
     ///
     /// This does not call any destructors. Use with caution.
     pub fn clear(&self) {
-        *self.allocated.borrow_mut() = [false; N];
-        *self.next_free.borrow_mut() = 0;
+        // Rebuild free list
+        let mut slots = self.slots.borrow_mut();
+        for i in 0..N {
+            slots[i] = Slot::Free {
+                next_free: if i + 1 < N { i + 1 } else { FREE_LIST_END },
+            };
+        }
+
+        // Increment all generations to invalidate existing indices
+        let mut generations = self.generations.borrow_mut();
+        for g in generations.iter_mut() {
+            *g = g.wrapping_add(1);
+        }
+
+        *self.free_head.borrow_mut() = if N > 0 { 0 } else { FREE_LIST_END };
+        *self.len.borrow_mut() = 0;
     }
 
     /// Iterate over all allocated indices and values.
@@ -331,18 +413,21 @@ impl<T: Copy, const N: usize> Arena<T, N> {
     }
 
     fn calculate_fragmentation(&self) -> f32 {
-        let allocated = self.allocated.borrow();
+        let slots = self.slots.borrow();
         let mut fragments = 0;
         let mut in_free = false;
 
-        for &is_allocated in allocated.iter() {
-            if !is_allocated {
-                if !in_free {
-                    fragments += 1;
-                    in_free = true;
+        for slot in slots.iter() {
+            match slot {
+                Slot::Free { .. } => {
+                    if !in_free {
+                        fragments += 1;
+                        in_free = true;
+                    }
                 }
-            } else {
-                in_free = false;
+                Slot::Occupied { .. } => {
+                    in_free = false;
+                }
             }
         }
 
@@ -473,15 +558,16 @@ impl<'a, T: Copy, const N: usize> Iterator for ArenaIterator<'a, T, N> {
     type Item = (ArenaIndex, T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let allocated = self.arena.allocated.borrow();
+        let slots = self.arena.slots.borrow();
+        let generations = self.arena.generations.borrow();
 
         while self.current < N {
             let idx = self.current;
             self.current += 1;
 
-            if allocated[idx] {
-                let value = self.arena.cells.borrow()[idx];
-                return Some((ArenaIndex::new(idx), value));
+            if let Slot::Occupied { value } = slots[idx] {
+                let generation = generations[idx];
+                return Some((ArenaIndex::new(idx, generation), value));
             }
         }
 
@@ -572,7 +658,89 @@ mod tests {
         let idx = arena.alloc(42).unwrap();
         arena.free(idx).unwrap();
 
-        assert_eq!(arena.get(idx), Err(ArenaError::InvalidIndex));
+        // After freeing, the generation increments, so we get GenerationMismatch
+        assert_eq!(arena.get(idx), Err(ArenaError::GenerationMismatch));
+    }
+
+    #[test]
+    fn test_generational_indices_aba_protection() {
+        let arena: Arena<i32, 10> = Arena::new(0);
+
+        // Allocate and free a slot
+        let old_idx = arena.alloc(42).unwrap();
+        arena.free(old_idx).unwrap();
+
+        // Allocate a new value in the same slot
+        let new_idx = arena.alloc(999).unwrap();
+
+        // The old index should now be invalid (ABA problem prevented)
+        assert_eq!(arena.get(old_idx), Err(ArenaError::GenerationMismatch));
+        assert_eq!(arena.free(old_idx), Err(ArenaError::GenerationMismatch));
+
+        // The new index should work fine
+        assert_eq!(arena.get(new_idx).unwrap(), 999);
+
+        // Verify they point to the same raw slot but different generations
+        assert_eq!(old_idx.raw(), new_idx.raw());
+        assert_ne!(old_idx.generation(), new_idx.generation());
+    }
+
+    #[test]
+    fn test_free_list_o1_allocation() {
+        let arena: Arena<i32, 5> = Arena::new(0);
+
+        // Allocate all slots
+        let idx0 = arena.alloc(0).unwrap();
+        let idx1 = arena.alloc(1).unwrap();
+        let idx2 = arena.alloc(2).unwrap();
+        let idx3 = arena.alloc(3).unwrap();
+        let idx4 = arena.alloc(4).unwrap();
+
+        assert!(arena.is_full());
+
+        // Free some slots in non-sequential order
+        arena.free(idx2).unwrap();
+        arena.free(idx0).unwrap();
+        arena.free(idx4).unwrap();
+
+        assert_eq!(arena.len(), 2);
+        assert_eq!(arena.available(), 3);
+
+        // Allocate again - should reuse freed slots (LIFO order from free list)
+        let new1 = arena.alloc(100).unwrap();
+        let new2 = arena.alloc(200).unwrap();
+        let new3 = arena.alloc(300).unwrap();
+
+        assert_eq!(arena.len(), 5);
+
+        // Verify the new values are accessible
+        assert_eq!(arena.get(new1).unwrap(), 100);
+        assert_eq!(arena.get(new2).unwrap(), 200);
+        assert_eq!(arena.get(new3).unwrap(), 300);
+
+        // Original unfreed indices should still work
+        assert_eq!(arena.get(idx1).unwrap(), 1);
+        assert_eq!(arena.get(idx3).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_clear_invalidates_all_indices() {
+        let arena: Arena<i32, 10> = Arena::new(0);
+
+        let idx1 = arena.alloc(1).unwrap();
+        let idx2 = arena.alloc(2).unwrap();
+        let idx3 = arena.alloc(3).unwrap();
+
+        arena.clear();
+
+        // All old indices should be invalid
+        assert_eq!(arena.get(idx1), Err(ArenaError::GenerationMismatch));
+        assert_eq!(arena.get(idx2), Err(ArenaError::GenerationMismatch));
+        assert_eq!(arena.get(idx3), Err(ArenaError::GenerationMismatch));
+
+        // New allocations should work
+        let new_idx = arena.alloc(42).unwrap();
+        assert_eq!(arena.get(new_idx).unwrap(), 42);
     }
 
     #[test]
