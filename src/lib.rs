@@ -2,17 +2,17 @@
 
 //! # Fixed-Size Arena Allocator
 //!
-//! A minimal no-std, no-alloc arena allocator with fixed capacity.
+//! A minimal no-std arena allocator with fixed capacity.
 //!
 //! ## Features
 //!
 //! - **Fixed-size**: All memory pre-allocated at compile time
-//! - **No-std, no-alloc**: Works in embedded environments
+//! - **No-std**: Works in embedded environments (requires `alloc` for GC)
 //! - **Generic**: Works with any `Copy` type
 //! - **Interior mutability**: Safe concurrent access via `RefCell`
-//! - **Zero dependencies**: Only uses `RefCell`
 //! - **Generational indices**: Detects use-after-free (ABA problem)
 //! - **O(1) allocation**: Free-list based allocation and deallocation
+//! - **Mark-and-sweep GC**: Trait-based garbage collection via [`Trace`]
 //!
 //! ## Example
 //!
@@ -41,6 +41,9 @@
 //! arena.free(root).unwrap();
 //! ```
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::cell::RefCell;
 
 // ============================================================================
@@ -52,6 +55,12 @@ use core::cell::RefCell;
 /// This is a type-safe wrapper that stores both the slot index and the
 /// generation at which it was allocated. This prevents the ABA problem
 /// where a freed and reallocated slot could be accessed by a stale index.
+///
+/// # Safety Note
+///
+/// Indices should only be obtained from arena operations (`alloc`, `iter`).
+/// Manually constructing indices with [`ArenaIndex::new`] bypasses the type
+/// system's protection and should only be used for serialization/deserialization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ArenaIndex {
     index: usize,
@@ -60,6 +69,13 @@ pub struct ArenaIndex {
 
 impl ArenaIndex {
     /// Create a new arena index with the given slot index and generation.
+    ///
+    /// # Warning
+    ///
+    /// This is a low-level constructor intended for serialization/deserialization.
+    /// For normal use, obtain indices from [`Arena::alloc`] or [`Arena::iter`].
+    /// Fabricating indices manually may lead to undefined behavior if the
+    /// index/generation pair doesn't correspond to a valid allocation.
     #[inline]
     pub const fn new(index: usize, generation: u32) -> Self {
         ArenaIndex { index, generation }
@@ -131,6 +147,7 @@ enum Slot<T: Copy> {
 /// - `generations`: Array of generation counters for each slot
 /// - `free_head`: Head of the free list
 /// - `len`: Number of currently allocated slots
+/// - `gc_enabled`: Whether garbage collection is enabled
 ///
 /// # Generational Indices
 ///
@@ -142,17 +159,27 @@ enum Slot<T: Copy> {
 ///
 /// Uses a free-list for constant-time allocation and deallocation instead of
 /// scanning a bitmap.
+///
+/// # Garbage Collection
+///
+/// The arena supports mark-and-sweep garbage collection via the [`Trace`] trait.
+/// GC can be enabled or disabled at runtime using [`Arena::set_gc_enabled`].
+/// When disabled, [`Arena::collect_garbage`] returns immediately without collecting.
 pub struct Arena<T: Copy, const N: usize> {
     slots: RefCell<[Slot<T>; N]>,
     generations: RefCell<[u32; N]>,
     free_head: RefCell<usize>,
     len: RefCell<usize>,
+    gc_enabled: RefCell<bool>,
 }
 
 impl<T: Copy, const N: usize> Arena<T, N> {
     /// Create a new arena.
     ///
     /// All slots start as free, linked together in a free list.
+    /// Each slot is initialized with a unique generation based on its index,
+    /// which provides additional protection against accidentally using an
+    /// index meant for a different slot.
     ///
     /// # Example
     ///
@@ -171,12 +198,101 @@ impl<T: Copy, const N: usize> Arena<T, N> {
             };
         }
 
+        // Initialize each slot with a unique generation based on slot index.
+        // This prevents accidental cross-slot index fabrication from succeeding,
+        // since different slots will have different initial generations.
+        let mut generations = [0u32; N];
+        for i in 0..N {
+            generations[i] = i as u32;
+        }
+
         Arena {
             slots: RefCell::new(slots),
-            generations: RefCell::new([0u32; N]),
+            generations: RefCell::new(generations),
             free_head: RefCell::new(if N > 0 { 0 } else { FREE_LIST_END }),
             len: RefCell::new(0),
+            gc_enabled: RefCell::new(true), // GC enabled by default
         }
+    }
+
+    /// Check if garbage collection is enabled.
+    ///
+    /// When disabled, [`Arena::collect_garbage`] returns immediately without
+    /// performing any collection.
+    #[inline]
+    pub fn is_gc_enabled(&self) -> bool {
+        *self.gc_enabled.borrow()
+    }
+
+    /// Enable or disable garbage collection.
+    ///
+    /// When disabled, [`Arena::collect_garbage`] returns immediately with
+    /// zero marked/collected stats. This can be useful for:
+    /// - Performance-critical sections where you want to defer GC
+    /// - Debugging to isolate GC-related issues
+    /// - Temporarily pausing GC during batch operations
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use pwn_arena::Arena;
+    ///
+    /// let arena: Arena<i32, 100> = Arena::new(0);
+    ///
+    /// // Disable GC for a batch operation
+    /// arena.set_gc_enabled(false);
+    ///
+    /// // ... perform many allocations ...
+    ///
+    /// // Re-enable and collect
+    /// arena.set_gc_enabled(true);
+    /// ```
+    #[inline]
+    pub fn set_gc_enabled(&self, enabled: bool) {
+        *self.gc_enabled.borrow_mut() = enabled;
+    }
+
+    /// Temporarily disable GC, run a closure, then restore the previous state.
+    ///
+    /// This is useful for critical sections where GC should not run.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use pwn_arena::Arena;
+    ///
+    /// let arena: Arena<i32, 100> = Arena::new(0);
+    ///
+    /// let result = arena.without_gc(|| {
+    ///     // GC is disabled in here
+    ///     arena.alloc(42).unwrap()
+    /// });
+    /// // GC is re-enabled here
+    /// ```
+    pub fn without_gc<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let was_enabled = self.is_gc_enabled();
+        self.set_gc_enabled(false);
+        let result = f();
+        self.set_gc_enabled(was_enabled);
+        result
+    }
+
+    /// Temporarily enable GC, run a closure, then restore the previous state.
+    ///
+    /// This is useful when GC is normally disabled but you want to force
+    /// a collection in a specific section.
+    pub fn with_gc<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let was_enabled = self.is_gc_enabled();
+        self.set_gc_enabled(true);
+        let result = f();
+        self.set_gc_enabled(was_enabled);
+        result
     }
 
     /// Get the maximum capacity of this arena.
@@ -541,6 +657,290 @@ impl<T: Copy, const N: usize> Arena<T, N> {
         let value = self.get(index)?;
         let copied = value.copy_deep(self)?;
         self.alloc(copied)
+    }
+}
+
+// ============================================================================
+// Garbage Collection Support
+// ============================================================================
+
+/// Trait for types that can be traced by the garbage collector.
+///
+/// Implement this for types that contain `ArenaIndex` fields. The GC will
+/// call `trace` to discover all reachable objects starting from the roots.
+///
+/// # Example
+///
+/// ```rust
+/// use pwn_arena::{Arena, ArenaIndex, Trace};
+///
+/// #[derive(Clone, Copy)]
+/// enum Tree {
+///     Leaf(i32),
+///     Branch(ArenaIndex, ArenaIndex),
+/// }
+///
+/// impl<const N: usize> Trace<Tree, N> for Tree {
+///     fn trace<F: FnMut(ArenaIndex)>(&self, mut tracer: F) {
+///         match *self {
+///             Tree::Leaf(_) => {} // No references to trace
+///             Tree::Branch(left, right) => {
+///                 tracer(left);
+///                 tracer(right);
+///             }
+///         }
+///     }
+/// }
+///
+/// let arena: Arena<Tree, 100> = Arena::new(Tree::Leaf(0));
+///
+/// // Build a tree
+/// let leaf1 = arena.alloc(Tree::Leaf(1)).unwrap();
+/// let leaf2 = arena.alloc(Tree::Leaf(2)).unwrap();
+/// let root = arena.alloc(Tree::Branch(leaf1, leaf2)).unwrap();
+///
+/// // Also allocate some garbage (unreachable nodes)
+/// let garbage1 = arena.alloc(Tree::Leaf(999)).unwrap();
+/// let garbage2 = arena.alloc(Tree::Leaf(888)).unwrap();
+///
+/// assert_eq!(arena.len(), 5);
+///
+/// // Collect garbage, keeping only objects reachable from `root`
+/// let stats = arena.collect_garbage(&[root]);
+///
+/// assert_eq!(stats.collected, 2); // garbage1 and garbage2 were freed
+/// assert_eq!(arena.len(), 3);     // root, leaf1, leaf2 remain
+/// ```
+pub trait Trace<T: Copy, const N: usize> {
+    /// Trace all `ArenaIndex` references contained in this value.
+    ///
+    /// Call `tracer` once for each `ArenaIndex` field in this value.
+    /// The GC uses this to discover the object graph.
+    fn trace<F: FnMut(ArenaIndex)>(&self, tracer: F);
+}
+
+/// Statistics returned by garbage collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcStats {
+    /// Number of objects that were marked as reachable.
+    pub marked: usize,
+
+    /// Number of objects that were collected (freed).
+    pub collected: usize,
+
+    /// Number of objects that existed before collection.
+    pub total_before: usize,
+}
+
+impl<T: Copy, const N: usize> Arena<T, N> {
+    /// Perform mark-and-sweep garbage collection.
+    ///
+    /// Starting from the given `roots`, marks all reachable objects by
+    /// following `ArenaIndex` references (via the `Trace` trait), then
+    /// frees all unmarked (unreachable) objects.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. **Mark phase**: Starting from roots, recursively mark all reachable
+    ///    objects. Handles cycles correctly by checking if already marked.
+    /// 2. **Sweep phase**: Iterate through all slots and free any that are
+    ///    allocated but not marked.
+    ///
+    /// # Returns
+    ///
+    /// Returns `GcStats` with information about what was collected.
+    ///
+    /// # Complexity
+    ///
+    /// - Time: O(reachable + N) where N is arena capacity
+    /// - Space: O(N) for the mark bitmap
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use pwn_arena::{Arena, ArenaIndex, Trace};
+    ///
+    /// #[derive(Clone, Copy)]
+    /// struct Node {
+    ///     value: i32,
+    ///     next: Option<ArenaIndex>,
+    /// }
+    ///
+    /// impl<const N: usize> Trace<Node, N> for Node {
+    ///     fn trace<F: FnMut(ArenaIndex)>(&self, mut tracer: F) {
+    ///         if let Some(next) = self.next {
+    ///             tracer(next);
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// let arena: Arena<Node, 10> = Arena::new(Node { value: 0, next: None });
+    ///
+    /// // Create a linked list: root -> n1 -> n2
+    /// let n2 = arena.alloc(Node { value: 3, next: None }).unwrap();
+    /// let n1 = arena.alloc(Node { value: 2, next: Some(n2) }).unwrap();
+    /// let root = arena.alloc(Node { value: 1, next: Some(n1) }).unwrap();
+    ///
+    /// // Create some garbage
+    /// let _garbage = arena.alloc(Node { value: -1, next: None }).unwrap();
+    ///
+    /// // Collect with root as the only GC root
+    /// let stats = arena.collect_garbage(&[root]);
+    ///
+    /// assert_eq!(stats.collected, 1);
+    /// assert_eq!(arena.len(), 3);
+    /// ```
+    pub fn collect_garbage(&self, roots: &[ArenaIndex]) -> GcStats
+    where
+        T: Trace<T, N>,
+    {
+        let total_before = self.len();
+
+        // If GC is disabled, return immediately without collecting
+        if !self.is_gc_enabled() {
+            return GcStats {
+                marked: 0,
+                collected: 0,
+                total_before,
+            };
+        }
+
+        // Mark phase: track which slots are reachable
+        let mut marked = [false; N];
+        let mut mark_stack: Vec<ArenaIndex> = Vec::new();
+
+        // Initialize stack with valid roots
+        for &root in roots {
+            if self.is_allocated(root) {
+                let idx = root.raw();
+                if idx < N && !marked[idx] {
+                    marked[idx] = true;
+                    mark_stack.push(root);
+                }
+            }
+        }
+
+        // Process mark stack (depth-first traversal)
+        while let Some(current) = mark_stack.pop() {
+            if let Ok(value) = self.get(current) {
+                // Trace this value's references
+                value.trace(|child_index| {
+                    if self.is_allocated(child_index) {
+                        let idx = child_index.raw();
+                        if idx < N && !marked[idx] {
+                            marked[idx] = true;
+                            mark_stack.push(child_index);
+                        }
+                    }
+                });
+            }
+        }
+
+        let marked_count = marked.iter().filter(|&&m| m).count();
+
+        // Sweep phase: free all unmarked but allocated slots
+        let mut collected = 0;
+        let slots = self.slots.borrow();
+        let generations = self.generations.borrow();
+
+        // Collect indices to free (can't free while iterating)
+        let mut to_free: Vec<ArenaIndex> = Vec::new();
+
+        for idx in 0..N {
+            if let Slot::Occupied { .. } = slots[idx] {
+                if !marked[idx] {
+                    // This slot is allocated but not reachable - garbage!
+                    let index = ArenaIndex::new(idx, generations[idx]);
+                    to_free.push(index);
+                }
+            }
+        }
+
+        // Drop borrows before freeing
+        drop(slots);
+        drop(generations);
+
+        // Free the garbage
+        for index in to_free {
+            if self.free(index).is_ok() {
+                collected += 1;
+            }
+        }
+
+        GcStats {
+            marked: marked_count,
+            collected,
+            total_before,
+        }
+    }
+
+    /// Force garbage collection even if GC is disabled.
+    ///
+    /// This ignores the `gc_enabled` flag and always performs collection.
+    /// Useful when you need to collect garbage regardless of the current
+    /// GC state.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use pwn_arena::{Arena, ArenaIndex, Trace};
+    ///
+    /// #[derive(Clone, Copy)]
+    /// struct Leaf(i32);
+    ///
+    /// impl<const N: usize> Trace<Leaf, N> for Leaf {
+    ///     fn trace<F: FnMut(ArenaIndex)>(&self, _tracer: F) {}
+    /// }
+    ///
+    /// let arena: Arena<Leaf, 10> = Arena::new(Leaf(0));
+    /// arena.set_gc_enabled(false);
+    ///
+    /// arena.alloc(Leaf(1)).unwrap();
+    /// arena.alloc(Leaf(2)).unwrap(); // garbage
+    ///
+    /// let root = arena.alloc(Leaf(3)).unwrap();
+    ///
+    /// // This will NOT collect (GC disabled)
+    /// let stats = arena.collect_garbage(&[root]);
+    /// assert_eq!(stats.collected, 0);
+    ///
+    /// // This WILL collect (forced)
+    /// let stats = arena.collect_garbage_forced(&[root]);
+    /// assert_eq!(stats.collected, 2);
+    /// ```
+    pub fn collect_garbage_forced(&self, roots: &[ArenaIndex]) -> GcStats
+    where
+        T: Trace<T, N>,
+    {
+        let was_enabled = self.is_gc_enabled();
+        self.set_gc_enabled(true);
+        let result = self.collect_garbage(roots);
+        self.set_gc_enabled(was_enabled);
+        result
+    }
+
+    /// Perform garbage collection with multiple root sets.
+    ///
+    /// This is a convenience method that flattens multiple root arrays
+    /// into a single collection pass.
+    ///
+    /// Respects the `gc_enabled` flag - use [`Arena::collect_garbage_multi_forced`]
+    /// to ignore the flag.
+    pub fn collect_garbage_multi(&self, root_sets: &[&[ArenaIndex]]) -> GcStats
+    where
+        T: Trace<T, N>,
+    {
+        let roots: Vec<ArenaIndex> = root_sets.iter().flat_map(|s| s.iter().copied()).collect();
+        self.collect_garbage(&roots)
+    }
+
+    /// Force garbage collection with multiple root sets, ignoring the `gc_enabled` flag.
+    pub fn collect_garbage_multi_forced(&self, root_sets: &[&[ArenaIndex]]) -> GcStats
+    where
+        T: Trace<T, N>,
+    {
+        let roots: Vec<ArenaIndex> = root_sets.iter().flat_map(|s| s.iter().copied()).collect();
+        self.collect_garbage_forced(&roots)
     }
 }
 
