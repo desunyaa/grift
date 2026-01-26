@@ -2,12 +2,18 @@
 
 //! # Lisp Evaluator
 //!
-//! A PURE Lisp evaluator with **hybrid evaluation** strategy:
-//! - Lexically scoped closures
-//! - Tail Call Optimization (TCO)
-//! - Lazy data structures (like Haskell)
-//! - Strict control flow (enables proper TCO)
-//! - Rich error handling with stack traces
+//! A PURE Lisp evaluator with **fully trampolined evaluation** - no Rust stack
+//! recursion, enabling unlimited recursion depth (bounded only by heap/arena size).
+//!
+//! ## Key Features
+//!
+//! - **Full Trampolining**: All evaluation uses continuation-passing style with
+//!   an explicit continuation stack. No Rust recursion means no stack overflow.
+//! - **Hybrid Evaluation Strategy**: Strict in tail position, lazy elsewhere
+//! - **Proper TCO**: Tail calls reuse the same continuation frame
+//! - **Lexically Scoped Closures**: First-class functions with captured environments
+//! - **Lazy Data Structures**: Infinite streams like Haskell
+//! - **Rich Error Handling**: Error messages with stack traces
 //!
 //! ## Hybrid Evaluation Strategy
 //!
@@ -267,10 +273,69 @@ enum TcoResult {
 }
 
 // ============================================================================
+// Continuation-Based Trampoline (Full TCO)
+// ============================================================================
+
+/// Maximum continuation stack depth
+const MAX_CONT_DEPTH: usize = 1024;
+
+/// Continuation - what to do after a computation completes
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Some variants may be unused in certain code paths
+enum Cont {
+    /// We're done - return the value
+    Done,
+    
+    /// Force the result to WHNF, then continue
+    Force,
+    
+    /// Cache thunk result, then force the cached value
+    CacheThunk { thunk_idx: ArenaIndex, expr: ArenaIndex, env: ArenaIndex },
+    
+    /// After forcing function, decide builtin vs lambda
+    ApplyForced { args_expr: ArenaIndex, env: ArenaIndex, call_expr: ArenaIndex },
+    
+    /// After evaluating condition, choose branch
+    IfBranch { then_expr: ArenaIndex, else_expr: ArenaIndex, env: ArenaIndex },
+    
+    /// After forcing condition for builtin (variadic ops like +)
+    BuiltinForceArg { builtin: Builtin, remaining_args: ArenaIndex, 
+                      collected: ArenaIndex, call_expr: ArenaIndex },
+    
+    /// After forcing car/cdr argument - val is the forced pair
+    BuiltinCarCdr { builtin: Builtin, call_expr: ArenaIndex },
+    
+    /// OPTIMIZED: After forcing first arg of binary builtin, force second arg
+    BinaryBuiltinFirst { builtin: Builtin, second_arg: ArenaIndex, call_expr: ArenaIndex },
+    
+    /// OPTIMIZED: After forcing both args of binary builtin, apply
+    BinaryBuiltinSecond { builtin: Builtin, first_val: ArenaIndex, call_expr: ArenaIndex },
+    
+    /// After forcing first lambda arg, bind it to param
+    LambdaFirstBind { param: ArenaIndex },
+    
+    /// After binding a lambda arg, continue with remaining args
+    LambdaBindArg { remaining_exprs: ArenaIndex, eval_env: ArenaIndex,
+                    remaining_params: ArenaIndex, body: ArenaIndex,
+                    new_env: ArenaIndex, call_expr: ArenaIndex },
+}
+
+/// Trampoline state - what we're currently doing
+#[derive(Clone, Copy, Debug)]
+enum TrampolineState {
+    /// Evaluate expression in environment
+    Eval { expr: ArenaIndex, env: ArenaIndex },
+    /// Force a value to WHNF
+    Force { idx: ArenaIndex },
+    /// Return a value to the continuation
+    Return { val: ArenaIndex },
+}
+
+// ============================================================================
 // Evaluator
 // ============================================================================
 
-/// The Lisp evaluator with TCO support
+/// The Lisp evaluator with full trampolined TCO
 pub struct Evaluator<'a, const N: usize> {
     lisp: &'a Lisp<N>,
     /// Global environment
@@ -278,6 +343,9 @@ pub struct Evaluator<'a, const N: usize> {
     /// Call stack for error reporting
     call_stack: [StackFrame; MAX_STACK_DEPTH],
     call_stack_depth: usize,
+    /// Continuation stack for full trampolining
+    cont_stack: [Cont; MAX_CONT_DEPTH],
+    cont_depth: usize,
 }
 
 impl<'a, const N: usize> Evaluator<'a, N> {
@@ -288,6 +356,8 @@ impl<'a, const N: usize> Evaluator<'a, N> {
             global_env: ArenaIndex::NULL,
             call_stack: [StackFrame::default(); MAX_STACK_DEPTH],
             call_stack_depth: 0,
+            cont_stack: [Cont::Done; MAX_CONT_DEPTH],
+            cont_depth: 0,
         };
         
         // Initialize global environment with builtins
@@ -449,185 +519,791 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     }
     
     // ========================================================================
-    // Main Evaluation - TCO via Trampoline
+    // Main Evaluation - Full Trampoline (No Rust Recursion)
     // ========================================================================
+    
+    /// Push a continuation onto the stack
+    fn push_cont(&mut self, cont: Cont) -> Result<(), EvalError> {
+        if self.cont_depth >= MAX_CONT_DEPTH {
+            return Err(EvalError::new(ErrorKind::StackOverflow));
+        }
+        self.cont_stack[self.cont_depth] = cont;
+        self.cont_depth += 1;
+        Ok(())
+    }
+    
+    /// Pop a continuation from the stack
+    fn pop_cont(&mut self) -> Cont {
+        if self.cont_depth == 0 {
+            Cont::Done
+        } else {
+            self.cont_depth -= 1;
+            self.cont_stack[self.cont_depth]
+        }
+    }
+    
     
     /// Evaluate an expression (entry point)
     pub fn eval(&mut self, expr: ArenaIndex) -> EvalResult {
-        let result = self.eval_in_env(expr, self.global_env)?;
-        // Force the result at top level (WHNF)
-        self.force(result)
+        // Reset continuation stack
+        self.cont_depth = 0;
+        // Push Force continuation to force result at top level
+        self.push_cont(Cont::Force)?;
+        // Start evaluation
+        self.trampoline(TrampolineState::Eval { expr, env: self.global_env })
     }
     
     /// Evaluate an expression in a given environment
-    /// Uses a trampoline loop for TCO
+    /// Uses full trampolining - no Rust recursion
     /// 
     /// This is public so the REPL can force thunks for display
-    pub fn eval_in_env(&mut self, mut expr: ArenaIndex, mut env: ArenaIndex) -> EvalResult {
+    pub fn eval_in_env(&mut self, expr: ArenaIndex, env: ArenaIndex) -> EvalResult {
+        // Reset continuation stack and run
+        self.cont_depth = 0;
+        self.trampoline(TrampolineState::Eval { expr, env })
+    }
+    
+    /// The main trampoline loop - processes states and continuations
+    /// This is the ONLY place where looping happens - no Rust recursion!
+    fn trampoline(&mut self, mut state: TrampolineState) -> EvalResult {
         loop {
-            let val = self.lisp.get(expr)?;
-            
-            match val {
-                // Self-evaluating values
-                Value::Nil | Value::True | Value::False | 
-                Value::Number(_) | Value::Char(_) | 
-                Value::Builtin(_) | Value::Lambda { .. } | Value::Thunk { .. } => {
-                    return Ok(expr);
+            state = match state {
+                TrampolineState::Eval { expr, env } => {
+                    self.step_eval(expr, env)?
                 }
-                
-                // Symbol - variable lookup
-                Value::Symbol { .. } => {
-                    return self.env_lookup(env, expr);
+                TrampolineState::Force { idx } => {
+                    self.step_force(idx)?
                 }
-                
-                // List - special form or function application
-                Value::Cons { car, cdr } => {
-                    let head = self.lisp.get(car)?;
-                    
-                    // Check for special forms
-                    if let Value::Symbol { .. } = head {
-                        // quote
-                        if self.lisp.symbol_matches(car, "quote")? {
-                            return Ok(self.lisp.car(cdr)?);
-                        }
-                        
-                        // if - condition is strict, branches are lazy
-                        if self.lisp.symbol_matches(car, "if")? {
-                            let cond_expr = self.lisp.car(cdr)?;
-                            let rest = self.lisp.cdr(cdr)?;
-                            let then_expr = self.lisp.car(rest)?;
-                            let else_rest = self.lisp.cdr(rest)?;
-                            
-                            // Evaluate AND FORCE condition (strict position)
-                            let cond_thunk = self.eval_in_env(cond_expr, env)?;
-                            let cond_val = self.force(cond_thunk)?;
-                            
-                            // Choose branch - return as thunk (lazy)
-                            if !self.is_false(cond_val)? {
-                                expr = then_expr;
-                                continue;
-                            } else if !self.lisp.get(else_rest)?.is_nil() {
-                                expr = self.lisp.car(else_rest)?;
-                                continue;
-                            } else {
-                                return self.lisp.nil().map_err(Into::into);
-                            }
-                        }
-                        
-                        // cond - TCO in final clause
-                        if self.lisp.symbol_matches(car, "cond")? {
-                            match self.eval_cond_tco(cdr, env)? {
-                                TcoResult::Return(val) => return Ok(val),
-                                TcoResult::TailCall { new_expr, new_env } => {
-                                    expr = new_expr;
-                                    env = new_env;
-                                    continue;
-                                }
-                            }
-                        }
-                        
-                        // lambda
-                        if self.lisp.symbol_matches(car, "lambda")? {
-                            return self.eval_lambda(cdr, env);
-                        }
-                        
-                        // define
-                        if self.lisp.symbol_matches(car, "define")? {
-                            return self.eval_define(cdr, env);
-                        }
-                        
-                        // let - TCO in body
-                        if self.lisp.symbol_matches(car, "let")? {
-                            let (new_expr, new_env) = self.eval_let_tco(cdr, env)?;
-                            expr = new_expr;
-                            env = new_env;
-                            continue;
-                        }
-                        
-                        // let* - TCO in body
-                        if self.lisp.symbol_matches(car, "let*")? {
-                            let (new_expr, new_env) = self.eval_let_star_tco(cdr, env)?;
-                            expr = new_expr;
-                            env = new_env;
-                            continue;
-                        }
-                        
-                        // begin - TCO in last expression
-                        if self.lisp.symbol_matches(car, "begin")? {
-                            match self.eval_begin_tco(cdr, env)? {
-                                TcoResult::Return(val) => return Ok(val),
-                                TcoResult::TailCall { new_expr, new_env } => {
-                                    expr = new_expr;
-                                    env = new_env;
-                                    continue;
-                                }
-                            }
-                        }
-                        
-                        // NOTE: set! removed - this is a PURE Lisp!
-                        
-                        // and - short circuit
-                        if self.lisp.symbol_matches(car, "and")? {
-                            match self.eval_and_tco(cdr, env)? {
-                                TcoResult::Return(val) => return Ok(val),
-                                TcoResult::TailCall { new_expr, new_env } => {
-                                    expr = new_expr;
-                                    env = new_env;
-                                    continue;
-                                }
-                            }
-                        }
-                        
-                        // or - short circuit
-                        if self.lisp.symbol_matches(car, "or")? {
-                            match self.eval_or_tco(cdr, env)? {
-                                TcoResult::Return(val) => return Ok(val),
-                                TcoResult::TailCall { new_expr, new_env } => {
-                                    expr = new_expr;
-                                    env = new_env;
-                                    continue;
-                                }
-                            }
-                        }
-                        
-                        // NOTE: No explicit 'delay' - hybrid evaluation strategy
+                TrampolineState::Return { val } => {
+                    match self.step_return(val)? {
+                        Some(new_state) => new_state,
+                        None => return Ok(val), // Done!
                     }
-                    
-                    // Function application - HYBRID EVALUATION:
-                    // - Builtins: lazy args (builtins force what they need)
-                    // - Lambda tail calls: STRICT args (enables TCO, no thunk accumulation)
-                    self.push_frame(expr, car)?;
-                    
-                    let func_thunk = self.eval_in_env(car, env)?;
-                    let func = self.force(func_thunk)?;
-                    
-                    match self.lisp.get(func)? {
-                        Value::Builtin(b) => {
-                            // Builtins: LAZY - wrap args in thunks
-                            // Builtins handle their own strictness
-                            let args = self.make_thunk_list(cdr, env)?;
-                            let result = self.apply_builtin(b, args, expr)?;
-                            self.pop_frame();
-                            return Ok(result);
-                        }
-                        Value::Lambda { params, body, env: closure_env } => {
-                            // Lambda tail calls: STRICT - evaluate args now
-                            // This enables proper TCO without thunk accumulation
-                            let args = self.eval_list_strict(cdr, env)?;
-                            let new_env = self.bind_params(params, args, closure_env, expr)?;
-                            self.pop_frame();
-                            expr = body;
-                            env = new_env;
-                            continue;
-                        }
-                        _ => {
-                            self.pop_frame();
-                            return Err(self.type_error(car, "procedure", self.lisp.get(func)?.type_name()));
-                        }
+                }
+            };
+        }
+    }
+    
+    /// One step of evaluation
+    fn step_eval(&mut self, expr: ArenaIndex, env: ArenaIndex) -> Result<TrampolineState, EvalError> {
+        let val = self.lisp.get(expr)?;
+        
+        match val {
+            // Self-evaluating values
+            Value::Nil | Value::True | Value::False | 
+            Value::Number(_) | Value::Char(_) | 
+            Value::Builtin(_) | Value::Lambda { .. } | Value::Thunk { .. } => {
+                Ok(TrampolineState::Return { val: expr })
+            }
+            
+            // Symbol - variable lookup
+            Value::Symbol { .. } => {
+                let val = self.env_lookup(env, expr)?;
+                Ok(TrampolineState::Return { val })
+            }
+            
+            // List - special form or function application
+            Value::Cons { car, cdr } => {
+                self.step_eval_list(car, cdr, expr, env)
+            }
+        }
+    }
+    
+    /// Evaluate a list (special form or application)
+    fn step_eval_list(&mut self, car: ArenaIndex, cdr: ArenaIndex, expr: ArenaIndex, env: ArenaIndex) 
+        -> Result<TrampolineState, EvalError> 
+    {
+        let head = self.lisp.get(car)?;
+        
+        // Check for special forms
+        if let Value::Symbol { .. } = head {
+            // quote
+            if self.lisp.symbol_matches(car, "quote")? {
+                let val = self.lisp.car(cdr)?;
+                return Ok(TrampolineState::Return { val });
+            }
+            
+            // if - condition is strict, branches are lazy
+            if self.lisp.symbol_matches(car, "if")? {
+                let cond_expr = self.lisp.car(cdr)?;
+                let rest = self.lisp.cdr(cdr)?;
+                let then_expr = self.lisp.car(rest)?;
+                let else_rest = self.lisp.cdr(rest)?;
+                let else_expr = if self.lisp.get(else_rest)?.is_nil() {
+                    self.lisp.nil()?
+                } else {
+                    self.lisp.car(else_rest)?
+                };
+                
+                // Push continuation for after condition is forced
+                self.push_cont(Cont::IfBranch { then_expr, else_expr, env })?;
+                self.push_cont(Cont::Force)?;
+                
+                // Evaluate condition
+                return Ok(TrampolineState::Eval { expr: cond_expr, env });
+            }
+            
+            // cond - TCO in final clause
+            if self.lisp.symbol_matches(car, "cond")? {
+                return self.step_eval_cond(cdr, env);
+            }
+            
+            // lambda
+            if self.lisp.symbol_matches(car, "lambda")? {
+                let val = self.eval_lambda(cdr, env)?;
+                return Ok(TrampolineState::Return { val });
+            }
+            
+            // define
+            if self.lisp.symbol_matches(car, "define")? {
+                let val = self.eval_define(cdr, env)?;
+                return Ok(TrampolineState::Return { val });
+            }
+            
+            // let - TCO in body
+            if self.lisp.symbol_matches(car, "let")? {
+                let (new_expr, new_env) = self.eval_let_tco(cdr, env)?;
+                return Ok(TrampolineState::Eval { expr: new_expr, env: new_env });
+            }
+            
+            // let* - TCO in body
+            if self.lisp.symbol_matches(car, "let*")? {
+                let (new_expr, new_env) = self.eval_let_star_tco(cdr, env)?;
+                return Ok(TrampolineState::Eval { expr: new_expr, env: new_env });
+            }
+            
+            // begin - TCO in last expression
+            if self.lisp.symbol_matches(car, "begin")? {
+                match self.eval_begin_tco(cdr, env)? {
+                    TcoResult::Return(val) => return Ok(TrampolineState::Return { val }),
+                    TcoResult::TailCall { new_expr, new_env } => {
+                        return Ok(TrampolineState::Eval { expr: new_expr, env: new_env });
+                    }
+                }
+            }
+            
+            // and - short circuit
+            if self.lisp.symbol_matches(car, "and")? {
+                match self.eval_and_tco(cdr, env)? {
+                    TcoResult::Return(val) => return Ok(TrampolineState::Return { val }),
+                    TcoResult::TailCall { new_expr, new_env } => {
+                        return Ok(TrampolineState::Eval { expr: new_expr, env: new_env });
+                    }
+                }
+            }
+            
+            // or - short circuit
+            if self.lisp.symbol_matches(car, "or")? {
+                match self.eval_or_tco(cdr, env)? {
+                    TcoResult::Return(val) => return Ok(TrampolineState::Return { val }),
+                    TcoResult::TailCall { new_expr, new_env } => {
+                        return Ok(TrampolineState::Eval { expr: new_expr, env: new_env });
                     }
                 }
             }
         }
+        
+        // Function application - HYBRID EVALUATION
+        self.push_frame(expr, car)?;
+        
+        // Push continuation: after evaluating func, force it, then apply
+        self.push_cont(Cont::ApplyForced { args_expr: cdr, env, call_expr: expr })?;
+        self.push_cont(Cont::Force)?;
+        
+        // Evaluate the function expression
+        Ok(TrampolineState::Eval { expr: car, env })
+    }
+    
+    /// Evaluate cond (trampolined)
+    fn step_eval_cond(&mut self, clauses: ArenaIndex, env: ArenaIndex) -> Result<TrampolineState, EvalError> {
+        match self.eval_cond_tco(clauses, env)? {
+            TcoResult::Return(val) => Ok(TrampolineState::Return { val }),
+            TcoResult::TailCall { new_expr, new_env } => {
+                Ok(TrampolineState::Eval { expr: new_expr, env: new_env })
+            }
+        }
+    }
+    
+    /// One step of forcing
+    fn step_force(&mut self, idx: ArenaIndex) -> Result<TrampolineState, EvalError> {
+        let val = self.lisp.get(idx)?;
+        
+        match val {
+            Value::Thunk { expr, env, cached } => {
+                if !cached.is_null() {
+                    // Already cached - but might be a thunk, so force again
+                    Ok(TrampolineState::Force { idx: cached })
+                } else {
+                    // Need to evaluate - push continuation to cache result
+                    self.push_cont(Cont::CacheThunk { thunk_idx: idx, expr, env })?;
+                    Ok(TrampolineState::Eval { expr, env })
+                }
+            }
+            _ => {
+                // Not a thunk - return as WHNF
+                Ok(TrampolineState::Return { val: idx })
+            }
+        }
+    }
+    
+    /// Process a return value with the current continuation
+    fn step_return(&mut self, val: ArenaIndex) -> Result<Option<TrampolineState>, EvalError> {
+        let cont = self.pop_cont();
+        
+        match cont {
+            Cont::Done => {
+                // No more continuations - we're done
+                Ok(None)
+            }
+            
+            Cont::Force { .. } => {
+                // Force the returned value
+                Ok(Some(TrampolineState::Force { idx: val }))
+            }
+            
+            Cont::CacheThunk { thunk_idx, expr, env } => {
+                // Cache the result in the thunk
+                self.lisp.set(thunk_idx, Value::Thunk { expr, env, cached: val })?;
+                // Now force the result (it might be a thunk too)
+                Ok(Some(TrampolineState::Force { idx: val }))
+            }
+            
+            Cont::IfBranch { then_expr, else_expr, env } => {
+                // val is the forced condition
+                let branch = if !self.is_false(val)? { then_expr } else { else_expr };
+                if branch.is_null() {
+                    let nil = self.lisp.nil()?;
+                    Ok(Some(TrampolineState::Return { val: nil }))
+                } else {
+                    Ok(Some(TrampolineState::Eval { expr: branch, env }))
+                }
+            }
+            
+            Cont::ApplyForced { args_expr, env, call_expr } => {
+                // val is the forced function
+                match self.lisp.get(val)? {
+                    Value::Builtin(b) => {
+                        // Builtins: LAZY - wrap args in thunks
+                        let args = self.make_thunk_list(args_expr, env)?;
+                        let result = self.apply_builtin_trampolined(b, args, call_expr)?;
+                        self.pop_frame();
+                        Ok(Some(result))
+                    }
+                    Value::Lambda { params, body, env: closure_env } => {
+                        // Lambda: STRICT - evaluate args and bind directly to params
+                        // OPTIMIZED: No intermediate list building - binds params as we go
+                        self.pop_frame();
+                        
+                        if self.lisp.get(args_expr)?.is_nil() {
+                            // No args - check params are also empty
+                            if !self.lisp.get(params)?.is_nil() {
+                                let expected = self.count_list(params)?;
+                                return Err(self.arg_error(call_expr, expected, 0));
+                            }
+                            Ok(Some(TrampolineState::Eval { expr: body, env: closure_env }))
+                        } else {
+                            // Start evaluating first arg and binding
+                            let first_expr = self.lisp.car(args_expr)?;
+                            let rest_exprs = self.lisp.cdr(args_expr)?;
+                            
+                            // Check we have params to bind
+                            if self.lisp.get(params)?.is_nil() {
+                                let got = self.count_list(args_expr)?;
+                                return Err(self.arg_error(call_expr, 0, got));
+                            }
+                            
+                            let first_param = self.lisp.car(params)?;
+                            let rest_params = self.lisp.cdr(params)?;
+                            
+                            // Start with closure_env, we'll extend as we bind
+                            self.push_cont(Cont::LambdaBindArg {
+                                remaining_exprs: rest_exprs, eval_env: env,
+                                remaining_params: rest_params, body, 
+                                new_env: closure_env, call_expr
+                            })?;
+                            // Push binding continuation for first param
+                            self.push_cont(Cont::LambdaFirstBind { param: first_param })?;
+                            self.push_cont(Cont::Force)?;
+                            
+                            Ok(Some(TrampolineState::Eval { expr: first_expr, env }))
+                        }
+                    }
+                    _ => {
+                        self.pop_frame();
+                        Err(self.type_error(call_expr, "procedure", self.lisp.get(val)?.type_name()))
+                    }
+                }
+            }
+            
+            Cont::LambdaFirstBind { param } => {
+                // val is forced first arg - bind to param
+                // Pop LambdaBindArg, extend env, push it back
+                let cont = self.pop_cont();
+                if let Cont::LambdaBindArg { remaining_exprs, eval_env, remaining_params, body, new_env, call_expr } = cont {
+                    // Extend environment with binding
+                    let extended_env = self.env_extend(new_env, param, val)?;
+                    
+                    if self.lisp.get(remaining_exprs)?.is_nil() {
+                        // No more args - check params match
+                        if !self.lisp.get(remaining_params)?.is_nil() {
+                            let expected = self.count_list(remaining_params)? + 1;
+                            return Err(self.arg_error(call_expr, expected, 1));
+                        }
+                        // Evaluate body with extended env
+                        Ok(Some(TrampolineState::Eval { expr: body, env: extended_env }))
+                    } else {
+                        // More args - get next param
+                        if self.lisp.get(remaining_params)?.is_nil() {
+                            let got = self.count_list(remaining_exprs)? + 1;
+                            return Err(self.arg_error(call_expr, 1, got));
+                        }
+                        
+                        let next_param = self.lisp.car(remaining_params)?;
+                        let rest_params = self.lisp.cdr(remaining_params)?;
+                        let next_expr = self.lisp.car(remaining_exprs)?;
+                        let rest_exprs = self.lisp.cdr(remaining_exprs)?;
+                        
+                        // Continue with remaining args
+                        self.push_cont(Cont::LambdaBindArg {
+                            remaining_exprs: rest_exprs, eval_env,
+                            remaining_params: rest_params, body,
+                            new_env: extended_env, call_expr
+                        })?;
+                        self.push_cont(Cont::LambdaFirstBind { param: next_param })?;
+                        self.push_cont(Cont::Force)?;
+                        
+                        Ok(Some(TrampolineState::Eval { expr: next_expr, env: eval_env }))
+                    }
+                } else {
+                    // This shouldn't happen
+                    Err(self.make_error(ErrorKind::Generic, val))
+                }
+            }
+            
+            Cont::LambdaBindArg { .. } => {
+                // This shouldn't be hit directly - LambdaFirstBind pops it
+                Err(self.make_error(ErrorKind::Generic, val))
+            }
+            
+            Cont::BuiltinForceArg { builtin, remaining_args, collected, call_expr } => {
+                // val is a forced argument for a strict builtin
+                let new_collected = self.lisp.cons(val, collected)?;
+                
+                if self.lisp.get(remaining_args)?.is_nil() {
+                    // All args forced - apply builtin
+                    let args = self.reverse_list(new_collected)?;
+                    let result = self.apply_builtin_with_forced_args(builtin, args, call_expr)?;
+                    Ok(Some(TrampolineState::Return { val: result }))
+                } else {
+                    // More args to force
+                    let next_arg = self.lisp.car(remaining_args)?;
+                    let rest_args = self.lisp.cdr(remaining_args)?;
+                    
+                    self.push_cont(Cont::BuiltinForceArg {
+                        builtin, remaining_args: rest_args, collected: new_collected, call_expr
+                    })?;
+                    
+                    Ok(Some(TrampolineState::Force { idx: next_arg }))
+                }
+            }
+            
+            Cont::BinaryBuiltinFirst { builtin, second_arg, call_expr } => {
+                // val is first forced arg - now force second
+                self.push_cont(Cont::BinaryBuiltinSecond { builtin, first_val: val, call_expr })?;
+                Ok(Some(TrampolineState::Force { idx: second_arg }))
+            }
+            
+            Cont::BinaryBuiltinSecond { builtin, first_val, call_expr } => {
+                // val is second forced arg - apply binary operation directly
+                let result = self.apply_binary_builtin(builtin, first_val, val, call_expr)?;
+                Ok(Some(TrampolineState::Return { val: result }))
+            }
+            
+            Cont::BuiltinCarCdr { builtin, call_expr } => {
+                // val is the forced pair argument for car/cdr
+                match self.lisp.get(val)? {
+                    Value::Cons { car, cdr } => {
+                        let result = match builtin {
+                            Builtin::Car => car,
+                            Builtin::Cdr => cdr,
+                            _ => unreachable!(),
+                        };
+                        Ok(Some(TrampolineState::Return { val: result }))
+                    }
+                    Value::Nil => {
+                        let nil = self.lisp.nil()?;
+                        Ok(Some(TrampolineState::Return { val: nil }))
+                    }
+                    _ => Err(self.type_error(call_expr, "pair", self.lisp.get(val)?.type_name())),
+                }
+            }
+        }
+    }
+    
+    /// Reverse a list (used for BuiltinForceArg fallback path)
+    fn reverse_list(&self, mut list: ArenaIndex) -> EvalResult {
+        let mut result = self.lisp.nil()?;
+        loop {
+            match self.lisp.get(list)? {
+                Value::Nil => return Ok(result),
+                Value::Cons { car, cdr } => {
+                    result = self.lisp.cons(car, result)?;
+                    list = cdr;
+                }
+                _ => return Err(self.make_error(ErrorKind::TypeError, list)),
+            }
+        }
+    }
+    
+    /// Apply a builtin function (trampolined version)
+    /// Returns next trampoline state instead of final value
+    fn apply_builtin_trampolined(&mut self, builtin: Builtin, args: ArenaIndex, call_expr: ArenaIndex) 
+        -> Result<TrampolineState, EvalError> 
+    {
+        // For strict builtins, we need to force args using continuations
+        // For non-strict builtins (cons, list, car, cdr), we can return immediately
+        
+        match builtin {
+            // NON-STRICT builtins - return immediately
+            Builtin::Cons => {
+                let a = self.lisp.car(args)?;
+                let rest = self.lisp.cdr(args)?;
+                let b = self.lisp.car(rest)?;
+                let result = self.lisp.cons(a, b)?;
+                Ok(TrampolineState::Return { val: result })
+            }
+            
+            Builtin::List => {
+                Ok(TrampolineState::Return { val: args })
+            }
+            
+            // car/cdr: force the pair, but return element (may be thunk)
+            Builtin::Car | Builtin::Cdr => {
+                let arg = self.lisp.car(args)?;
+                // Push continuation to handle after forcing - use special CarCdr continuation
+                self.push_cont(Cont::BuiltinCarCdr { builtin, call_expr })?;
+                Ok(TrampolineState::Force { idx: arg })
+            }
+            
+            // STRICT builtins - need to force all args
+            // OPTIMIZATION: Use specialized path for binary operations (most common case)
+            _ => {
+                if self.lisp.get(args)?.is_nil() {
+                    // No args - apply immediately
+                    let result = self.apply_builtin_with_forced_args(builtin, args, call_expr)?;
+                    Ok(TrampolineState::Return { val: result })
+                } else {
+                    let first_arg = self.lisp.car(args)?;
+                    let rest_args = self.lisp.cdr(args)?;
+                    
+                    // Check if this is a binary operation (exactly 2 args)
+                    if !self.lisp.get(rest_args)?.is_nil() {
+                        let second_arg = self.lisp.car(rest_args)?;
+                        let rest_rest = self.lisp.cdr(rest_args)?;
+                        
+                        if self.lisp.get(rest_rest)?.is_nil() {
+                            // OPTIMIZED: Binary operation - no list allocation!
+                            self.push_cont(Cont::BinaryBuiltinFirst { 
+                                builtin, second_arg, call_expr
+                            })?;
+                            return Ok(TrampolineState::Force { idx: first_arg });
+                        }
+                    }
+                    
+                    // General case: multiple args, use list-based approach
+                    let nil = self.lisp.nil()?;
+                    
+                    self.push_cont(Cont::BuiltinForceArg {
+                        builtin, remaining_args: rest_args, collected: nil, call_expr
+                    })?;
+                    
+                    Ok(TrampolineState::Force { idx: first_arg })
+                }
+            }
+        }
+    }
+    
+    /// Apply a builtin with already-forced arguments
+    fn apply_builtin_with_forced_args(&mut self, builtin: Builtin, args: ArenaIndex, call_expr: ArenaIndex) 
+        -> EvalResult 
+    {
+        match builtin {
+            Builtin::Car => {
+                let arg = self.lisp.car(args)?;
+                match self.lisp.get(arg)? {
+                    Value::Cons { car, .. } => Ok(car),
+                    Value::Nil => self.lisp.nil().map_err(Into::into),
+                    _ => Err(self.type_error(call_expr, "pair", self.lisp.get(arg)?.type_name())),
+                }
+            }
+            
+            Builtin::Cdr => {
+                let arg = self.lisp.car(args)?;
+                match self.lisp.get(arg)? {
+                    Value::Cons { cdr, .. } => Ok(cdr),
+                    Value::Nil => self.lisp.nil().map_err(Into::into),
+                    _ => Err(self.type_error(call_expr, "pair", self.lisp.get(arg)?.type_name())),
+                }
+            }
+            
+            Builtin::Cons => {
+                let a = self.lisp.car(args)?;
+                let rest = self.lisp.cdr(args)?;
+                let b = self.lisp.car(rest)?;
+                self.lisp.cons(a, b).map_err(Into::into)
+            }
+            
+            Builtin::List => Ok(args),
+            
+            Builtin::Atom => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.lisp.get(arg)?.is_atom()).map_err(Into::into)
+            }
+            
+            Builtin::Eq => {
+                let a = self.lisp.car(args)?;
+                let rest = self.lisp.cdr(args)?;
+                let b = self.lisp.car(rest)?;
+                
+                let val_a = self.lisp.get(a)?;
+                let val_b = self.lisp.get(b)?;
+                
+                let eq = match (val_a, val_b) {
+                    (Value::Nil, Value::Nil) => true,
+                    (Value::True, Value::True) => true,
+                    (Value::False, Value::False) => true,
+                    (Value::Number(x), Value::Number(y)) => x == y,
+                    (Value::Char(x), Value::Char(y)) => x == y,
+                    (Value::Symbol { .. }, Value::Symbol { .. }) => self.lisp.symbol_eq(a, b)?,
+                    _ => a == b,
+                };
+                
+                self.lisp.boolean(eq).map_err(Into::into)
+            }
+            
+            Builtin::Null => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.lisp.get(arg)?.is_nil()).map_err(Into::into)
+            }
+            
+            Builtin::Pairp => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.lisp.get(arg)?.is_cons()).map_err(Into::into)
+            }
+            
+            Builtin::Numberp => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.lisp.get(arg)?.is_number()).map_err(Into::into)
+            }
+            
+            Builtin::Booleanp => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.lisp.get(arg)?.is_boolean()).map_err(Into::into)
+            }
+            
+            Builtin::Procedurep => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.lisp.get(arg)?.is_procedure()).map_err(Into::into)
+            }
+            
+            Builtin::Symbolp => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.lisp.get(arg)?.is_symbol()).map_err(Into::into)
+            }
+            
+            Builtin::Not => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.lisp.get(arg)?.is_false()).map_err(Into::into)
+            }
+            
+            Builtin::Add => self.numeric_fold_forced(args, 0, |a, b| a.checked_add(b), call_expr),
+            
+            Builtin::Sub => {
+                let first = self.get_number_from_forced(self.lisp.car(args)?, call_expr)?;
+                let rest = self.lisp.cdr(args)?;
+                if self.lisp.get(rest)?.is_nil() {
+                    self.lisp.number(-first).map_err(Into::into)
+                } else {
+                    self.numeric_fold_start_forced(rest, first, |a, b| a.checked_sub(b), call_expr)
+                }
+            }
+            
+            Builtin::Mul => self.numeric_fold_forced(args, 1, |a, b| a.checked_mul(b), call_expr),
+            
+            Builtin::Div => {
+                let first = self.get_number_from_forced(self.lisp.car(args)?, call_expr)?;
+                let rest = self.lisp.cdr(args)?;
+                self.numeric_fold_start_forced(rest, first, |a, b| {
+                    if b == 0 { None } else { a.checked_div(b) }
+                }, call_expr)
+            }
+            
+            Builtin::Mod => {
+                let a = self.get_number_from_forced(self.lisp.car(args)?, call_expr)?;
+                let b = self.get_number_from_forced(self.lisp.car(self.lisp.cdr(args)?)?, call_expr)?;
+                if b == 0 {
+                    return Err(self.make_error(ErrorKind::DivisionByZero, call_expr));
+                }
+                self.lisp.number(a % b).map_err(Into::into)
+            }
+            
+            Builtin::Lt => self.compare_forced(args, |a, b| a < b, call_expr),
+            Builtin::Gt => self.compare_forced(args, |a, b| a > b, call_expr),
+            Builtin::Le => self.compare_forced(args, |a, b| a <= b, call_expr),
+            Builtin::Ge => self.compare_forced(args, |a, b| a >= b, call_expr),
+            Builtin::NumEq => self.compare_forced(args, |a, b| a == b, call_expr),
+            
+            Builtin::Print | Builtin::Display => {
+                Ok(self.lisp.car(args)?)
+            }
+            
+            Builtin::Newline => {
+                self.lisp.nil().map_err(Into::into)
+            }
+            
+            Builtin::Error => {
+                let msg = self.lisp.car(args)?;
+                Err(self.make_error(ErrorKind::UserError, msg))
+            }
+        }
+    }
+    
+    /// OPTIMIZED: Apply binary builtin directly without list allocation
+    fn apply_binary_builtin(&mut self, builtin: Builtin, a: ArenaIndex, b: ArenaIndex, call_expr: ArenaIndex) 
+        -> EvalResult 
+    {
+        match builtin {
+            Builtin::Add => {
+                let x = self.get_number_from_forced(a, call_expr)?;
+                let y = self.get_number_from_forced(b, call_expr)?;
+                x.checked_add(y)
+                    .map(|n| self.lisp.number(n))
+                    .ok_or_else(|| self.make_error(ErrorKind::DivisionByZero, call_expr))?
+                    .map_err(Into::into)
+            }
+            Builtin::Sub => {
+                let x = self.get_number_from_forced(a, call_expr)?;
+                let y = self.get_number_from_forced(b, call_expr)?;
+                x.checked_sub(y)
+                    .map(|n| self.lisp.number(n))
+                    .ok_or_else(|| self.make_error(ErrorKind::DivisionByZero, call_expr))?
+                    .map_err(Into::into)
+            }
+            Builtin::Mul => {
+                let x = self.get_number_from_forced(a, call_expr)?;
+                let y = self.get_number_from_forced(b, call_expr)?;
+                x.checked_mul(y)
+                    .map(|n| self.lisp.number(n))
+                    .ok_or_else(|| self.make_error(ErrorKind::DivisionByZero, call_expr))?
+                    .map_err(Into::into)
+            }
+            Builtin::Div => {
+                let x = self.get_number_from_forced(a, call_expr)?;
+                let y = self.get_number_from_forced(b, call_expr)?;
+                if y == 0 {
+                    return Err(self.make_error(ErrorKind::DivisionByZero, call_expr));
+                }
+                self.lisp.number(x / y).map_err(Into::into)
+            }
+            Builtin::Mod => {
+                let x = self.get_number_from_forced(a, call_expr)?;
+                let y = self.get_number_from_forced(b, call_expr)?;
+                if y == 0 {
+                    return Err(self.make_error(ErrorKind::DivisionByZero, call_expr));
+                }
+                self.lisp.number(x % y).map_err(Into::into)
+            }
+            Builtin::Lt => {
+                let x = self.get_number_from_forced(a, call_expr)?;
+                let y = self.get_number_from_forced(b, call_expr)?;
+                self.lisp.boolean(x < y).map_err(Into::into)
+            }
+            Builtin::Gt => {
+                let x = self.get_number_from_forced(a, call_expr)?;
+                let y = self.get_number_from_forced(b, call_expr)?;
+                self.lisp.boolean(x > y).map_err(Into::into)
+            }
+            Builtin::Le => {
+                let x = self.get_number_from_forced(a, call_expr)?;
+                let y = self.get_number_from_forced(b, call_expr)?;
+                self.lisp.boolean(x <= y).map_err(Into::into)
+            }
+            Builtin::Ge => {
+                let x = self.get_number_from_forced(a, call_expr)?;
+                let y = self.get_number_from_forced(b, call_expr)?;
+                self.lisp.boolean(x >= y).map_err(Into::into)
+            }
+            Builtin::NumEq => {
+                let x = self.get_number_from_forced(a, call_expr)?;
+                let y = self.get_number_from_forced(b, call_expr)?;
+                self.lisp.boolean(x == y).map_err(Into::into)
+            }
+            Builtin::Eq => {
+                let val_a = self.lisp.get(a)?;
+                let val_b = self.lisp.get(b)?;
+                
+                let eq = match (val_a, val_b) {
+                    (Value::Nil, Value::Nil) => true,
+                    (Value::True, Value::True) => true,
+                    (Value::False, Value::False) => true,
+                    (Value::Number(x), Value::Number(y)) => x == y,
+                    (Value::Char(x), Value::Char(y)) => x == y,
+                    (Value::Symbol { .. }, Value::Symbol { .. }) => self.lisp.symbol_eq(a, b)?,
+                    _ => a == b,
+                };
+                
+                self.lisp.boolean(eq).map_err(Into::into)
+            }
+            Builtin::Cons => {
+                self.lisp.cons(a, b).map_err(Into::into)
+            }
+            // For other builtins, fall back to list-based approach
+            _ => {
+                let rest = self.lisp.cons(b, self.lisp.nil()?)?;
+                let args = self.lisp.cons(a, rest)?;
+                self.apply_builtin_with_forced_args(builtin, args, call_expr)
+            }
+        }
+    }
+    
+    /// Get number from already-forced value
+    fn get_number_from_forced(&self, idx: ArenaIndex, call_expr: ArenaIndex) -> Result<i64, EvalError> {
+        match self.lisp.get(idx)? {
+            Value::Number(n) => Ok(n),
+            v => Err(self.type_error(call_expr, "number", v.type_name())),
+        }
+    }
+    
+    /// Numeric fold with already-forced args
+    fn numeric_fold_forced<F>(&self, args: ArenaIndex, init: i64, f: F, call_expr: ArenaIndex) -> EvalResult
+    where F: Fn(i64, i64) -> Option<i64>
+    {
+        self.numeric_fold_start_forced(args, init, f, call_expr)
+    }
+    
+    fn numeric_fold_start_forced<F>(&self, args: ArenaIndex, mut acc: i64, f: F, call_expr: ArenaIndex) -> EvalResult
+    where F: Fn(i64, i64) -> Option<i64>
+    {
+        let mut current = args;
+        loop {
+            match self.lisp.get(current)? {
+                Value::Nil => return self.lisp.number(acc).map_err(Into::into),
+                Value::Cons { car, cdr } => {
+                    let n = self.get_number_from_forced(car, call_expr)?;
+                    acc = f(acc, n).ok_or_else(|| self.make_error(ErrorKind::DivisionByZero, call_expr))?;
+                    current = cdr;
+                }
+                _ => return Err(self.make_error(ErrorKind::TypeError, current)),
+            }
+        }
+    }
+    
+    fn compare_forced<F>(&self, args: ArenaIndex, cmp: F, call_expr: ArenaIndex) -> EvalResult
+    where F: Fn(i64, i64) -> bool
+    {
+        let a = self.get_number_from_forced(self.lisp.car(args)?, call_expr)?;
+        let b = self.get_number_from_forced(self.lisp.car(self.lisp.cdr(args)?)?, call_expr)?;
+        self.lisp.boolean(cmp(a, b)).map_err(Into::into)
     }
     
     // ========================================================================
@@ -864,62 +1540,7 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     // Helpers
     // ========================================================================
     
-    /// Evaluate a list of expressions (evaluates but doesn't force)
-    /// NOTE: Currently unused but kept for potential future use
-    #[allow(dead_code)]
-    fn eval_list(&mut self, list: ArenaIndex, env: ArenaIndex) -> EvalResult {
-        let val = self.lisp.get(list)?;
-        
-        match val {
-            Value::Nil => self.lisp.nil().map_err(Into::into),
-            Value::Cons { car, cdr } => {
-                let head = self.eval_in_env(car, env)?;
-                let tail = self.eval_list(cdr, env)?;
-                self.lisp.cons(head, tail).map_err(Into::into)
-            }
-            _ => Err(self.make_error(ErrorKind::TypeError, list)),
-        }
-    }
-    
-    /// Evaluate AND force a list of expressions (fully strict)
-    /// Used for tail-call arguments to enable proper TCO
-    /// 
-    /// ITERATIVE implementation to avoid Rust stack overflow
-    fn eval_list_strict(&mut self, list: ArenaIndex, env: ArenaIndex) -> EvalResult {
-        const MAX_ARGS: usize = 64;
-        // Use a dummy index as placeholder (will be overwritten)
-        let dummy = ArenaIndex::new(usize::MAX, u32::MAX);
-        let mut values: [ArenaIndex; MAX_ARGS] = [dummy; MAX_ARGS];
-        let mut count = 0;
-        let mut current = list;
-        
-        // First pass: collect all evaluated values (iterative)
-        loop {
-            match self.lisp.get(current)? {
-                Value::Nil => break,
-                Value::Cons { car, cdr } => {
-                    if count >= MAX_ARGS {
-                        return Err(self.make_error(ErrorKind::StackOverflow, list));
-                    }
-                    // Evaluate AND force each argument
-                    let head_thunk = self.eval_in_env(car, env)?;
-                    let head = self.force(head_thunk)?;
-                    values[count] = head;
-                    count += 1;
-                    current = cdr;
-                }
-                _ => return Err(self.make_error(ErrorKind::TypeError, list)),
-            }
-        }
-        
-        // Second pass: build result list (backwards to preserve order)
-        let mut result = self.lisp.nil()?;
-        for i in (0..count).rev() {
-            result = self.lisp.cons(values[i], result)?;
-        }
-        
-        Ok(result)
-    }
+    // NOTE: eval_list removed - trampoline handles evaluation directly
     
     /// Create a list of thunks from expressions (lazy - wraps each in a thunk)
     /// Used for builtin arguments (builtins handle their own strictness)
@@ -959,24 +1580,10 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         Ok(result)
     }
     
-    /// Force a list of thunks and return evaluated list
-    /// NOTE: Currently unused but kept for potential future use
-    #[allow(dead_code)]
-    fn force_list(&mut self, list: ArenaIndex) -> EvalResult {
-        let val = self.lisp.get(list)?;
-        
-        match val {
-            Value::Nil => self.lisp.nil().map_err(Into::into),
-            Value::Cons { car, cdr } => {
-                let head = self.force(car)?;
-                let tail = self.force_list(cdr)?;
-                self.lisp.cons(head, tail).map_err(Into::into)
-            }
-            _ => Err(self.make_error(ErrorKind::TypeError, list)),
-        }
-    }
+    // NOTE: eval_list_strict and force_list removed - handled by trampoline continuations
     
-    /// Bind parameters to arguments
+    /// Bind parameters to arguments (kept for potential future use with rest parameters)
+    #[allow(dead_code)]
     fn bind_params(&self, params: ArenaIndex, args: ArenaIndex, env: ArenaIndex, call_expr: ArenaIndex) -> EvalResult {
         let mut new_env = env;
         let mut params_cur = params;
@@ -1039,243 +1646,8 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         Ok(self.lisp.get(val)?.is_false())
     }
     
-    /// Force a thunk to WHNF (Weak Head Normal Form)
-    /// Evaluates thunks recursively until we get a non-thunk value
-    /// This is called automatically in strict positions
-    fn force(&mut self, mut idx: ArenaIndex) -> EvalResult {
-        // Loop to handle chains of thunks
-        loop {
-            let val = self.lisp.get(idx)?;
-            
-            match val {
-                Value::Thunk { expr, env, cached } => {
-                    if !cached.is_null() {
-                        // Already evaluated - check if cached value is also a thunk
-                        idx = cached;
-                        continue;
-                    }
-                    
-                    // Evaluate the thunk
-                    let result = self.eval_in_env(expr, env)?;
-                    
-                    // Cache the result (memoization)
-                    self.lisp.set(idx, Value::Thunk { expr, env, cached: result })?;
-                    
-                    // Result might be a thunk - continue forcing
-                    idx = result;
-                    continue;
-                }
-                _ => return Ok(idx), // Not a thunk, return as-is (WHNF)
-            }
-        }
-    }
-    
-    // ========================================================================
-    // Built-in Functions
-    // ========================================================================
-    
-    fn apply_builtin(&mut self, builtin: Builtin, args: ArenaIndex, call_expr: ArenaIndex) -> EvalResult {
-        match builtin {
-            // NON-STRICT: car/cdr force the pair but return elements (may be thunks)
-            Builtin::Car => {
-                let arg = self.force(self.lisp.car(args)?)?;
-                match self.lisp.get(arg)? {
-                    Value::Cons { car, .. } => Ok(car), // May be a thunk
-                    Value::Nil => self.lisp.nil().map_err(Into::into),
-                    _ => Err(self.type_error(call_expr, "pair", self.lisp.get(arg)?.type_name())),
-                }
-            }
-            
-            Builtin::Cdr => {
-                let arg = self.force(self.lisp.car(args)?)?;
-                match self.lisp.get(arg)? {
-                    Value::Cons { cdr, .. } => Ok(cdr), // May be a thunk
-                    Value::Nil => self.lisp.nil().map_err(Into::into),
-                    _ => Err(self.type_error(call_expr, "pair", self.lisp.get(arg)?.type_name())),
-                }
-            }
-            
-            // NON-STRICT: cons doesn't force - can contain thunks
-            Builtin::Cons => {
-                let a = self.lisp.car(args)?;
-                let rest = self.lisp.cdr(args)?;
-                let b = self.lisp.car(rest)?;
-                self.lisp.cons(a, b).map_err(Into::into)
-            }
-            
-            // NON-STRICT: list doesn't force arguments
-            Builtin::List => Ok(args),
-            
-            // STRICT PREDICATES: force argument to check type
-            Builtin::Atom => {
-                let arg = self.force(self.lisp.car(args)?)?;
-                self.lisp.boolean(self.lisp.get(arg)?.is_atom()).map_err(Into::into)
-            }
-            
-            Builtin::Eq => {
-                let a = self.force(self.lisp.car(args)?)?;
-                let rest = self.lisp.cdr(args)?;
-                let b = self.force(self.lisp.car(rest)?)?;
-                
-                let val_a = self.lisp.get(a)?;
-                let val_b = self.lisp.get(b)?;
-                
-                let eq = match (val_a, val_b) {
-                    (Value::Nil, Value::Nil) => true,
-                    (Value::True, Value::True) => true,
-                    (Value::False, Value::False) => true,
-                    (Value::Number(x), Value::Number(y)) => x == y,
-                    (Value::Char(x), Value::Char(y)) => x == y,
-                    (Value::Symbol { .. }, Value::Symbol { .. }) => self.lisp.symbol_eq(a, b)?,
-                    _ => a == b, // Same index
-                };
-                
-                self.lisp.boolean(eq).map_err(Into::into)
-            }
-            
-            Builtin::Null => {
-                let arg = self.force(self.lisp.car(args)?)?;
-                self.lisp.boolean(self.lisp.get(arg)?.is_nil()).map_err(Into::into)
-            }
-            
-            Builtin::Pairp => {
-                let arg = self.force(self.lisp.car(args)?)?;
-                self.lisp.boolean(self.lisp.get(arg)?.is_cons()).map_err(Into::into)
-            }
-            
-            Builtin::Numberp => {
-                let arg = self.force(self.lisp.car(args)?)?;
-                self.lisp.boolean(self.lisp.get(arg)?.is_number()).map_err(Into::into)
-            }
-            
-            Builtin::Booleanp => {
-                let arg = self.force(self.lisp.car(args)?)?;
-                self.lisp.boolean(self.lisp.get(arg)?.is_boolean()).map_err(Into::into)
-            }
-            
-            Builtin::Procedurep => {
-                let arg = self.force(self.lisp.car(args)?)?;
-                self.lisp.boolean(self.lisp.get(arg)?.is_procedure()).map_err(Into::into)
-            }
-            
-            Builtin::Symbolp => {
-                let arg = self.force(self.lisp.car(args)?)?;
-                self.lisp.boolean(self.lisp.get(arg)?.is_symbol()).map_err(Into::into)
-            }
-            
-            // NOTE: Force and Promisep builtins removed - evaluation is lazy by default
-            
-            Builtin::Not => {
-                let arg = self.force(self.lisp.car(args)?)?;
-                self.lisp.boolean(self.is_false(arg)?).map_err(Into::into)
-            }
-            
-            // STRICT ARITHMETIC: force all arguments
-            Builtin::Add => self.numeric_fold(args, 0, |a, b| a.checked_add(b), call_expr),
-            
-            Builtin::Sub => {
-                let first = self.get_number_strict(self.lisp.car(args)?, call_expr)?;
-                let rest = self.lisp.cdr(args)?;
-                if self.lisp.get(rest)?.is_nil() {
-                    // Unary minus
-                    self.lisp.number(-first).map_err(Into::into)
-                } else {
-                    self.numeric_fold_start(rest, first, |a, b| a.checked_sub(b), call_expr)
-                }
-            }
-            
-            Builtin::Mul => self.numeric_fold(args, 1, |a, b| a.checked_mul(b), call_expr),
-            
-            Builtin::Div => {
-                let first = self.get_number_strict(self.lisp.car(args)?, call_expr)?;
-                let rest = self.lisp.cdr(args)?;
-                self.numeric_fold_start(rest, first, |a, b| {
-                    if b == 0 { None } else { a.checked_div(b) }
-                }, call_expr)
-            }
-            
-            Builtin::Mod => {
-                let a = self.get_number_strict(self.lisp.car(args)?, call_expr)?;
-                let b = self.get_number_strict(self.lisp.car(self.lisp.cdr(args)?)?, call_expr)?;
-                if b == 0 {
-                    return Err(self.make_error(ErrorKind::DivisionByZero, call_expr));
-                }
-                self.lisp.number(a % b).map_err(Into::into)
-            }
-            
-            // STRICT COMPARISONS: force both arguments
-            Builtin::Lt => self.compare(args, |a, b| a < b, call_expr),
-            Builtin::Gt => self.compare(args, |a, b| a > b, call_expr),
-            Builtin::Le => self.compare(args, |a, b| a <= b, call_expr),
-            Builtin::Ge => self.compare(args, |a, b| a >= b, call_expr),
-            Builtin::NumEq => self.compare(args, |a, b| a == b, call_expr),
-            
-            // STRICT I/O: force for printing
-            Builtin::Print | Builtin::Display => {
-                let arg = self.force(self.lisp.car(args)?)?;
-                Ok(arg)
-            }
-            
-            Builtin::Newline => {
-                self.lisp.nil().map_err(Into::into)
-            }
-            
-            Builtin::Error => {
-                let msg = self.force(self.lisp.car(args)?)?;
-                Err(self.make_error(ErrorKind::UserError, msg))
-            }
-        }
-    }
-    
-    /// Get number from a value, forcing if needed (strict)
-    fn get_number_strict(&mut self, idx: ArenaIndex, call_expr: ArenaIndex) -> Result<i64, EvalError> {
-        let forced = self.force(idx)?;
-        match self.lisp.get(forced)? {
-            Value::Number(n) => Ok(n),
-            v => Err(self.type_error(call_expr, "number", v.type_name())),
-        }
-    }
-    
-    fn get_number(&self, idx: ArenaIndex, call_expr: ArenaIndex) -> Result<i64, EvalError> {
-        match self.lisp.get(idx)? {
-            Value::Number(n) => Ok(n),
-            v => Err(self.type_error(call_expr, "number", v.type_name())),
-        }
-    }
-    
-    fn numeric_fold<F>(&mut self, args: ArenaIndex, init: i64, f: F, call_expr: ArenaIndex) -> EvalResult
-    where F: Fn(i64, i64) -> Option<i64>
-    {
-        self.numeric_fold_start(args, init, f, call_expr)
-    }
-    
-    fn numeric_fold_start<F>(&mut self, args: ArenaIndex, mut acc: i64, f: F, call_expr: ArenaIndex) -> EvalResult
-    where F: Fn(i64, i64) -> Option<i64>
-    {
-        let mut current = args;
-        
-        loop {
-            match self.lisp.get(current)? {
-                Value::Nil => return self.lisp.number(acc).map_err(Into::into),
-                Value::Cons { car, cdr } => {
-                    // Force each argument (strict arithmetic)
-                    let n = self.get_number_strict(car, call_expr)?;
-                    acc = f(acc, n).ok_or_else(|| self.make_error(ErrorKind::DivisionByZero, call_expr))?;
-                    current = cdr;
-                }
-                _ => return Err(self.make_error(ErrorKind::TypeError, current)),
-            }
-        }
-    }
-    
-    fn compare<F>(&mut self, args: ArenaIndex, cmp: F, call_expr: ArenaIndex) -> EvalResult
-    where F: Fn(i64, i64) -> bool
-    {
-        // Force both arguments (strict comparison)
-        let a = self.get_number_strict(self.lisp.car(args)?, call_expr)?;
-        let b = self.get_number_strict(self.lisp.car(self.lisp.cdr(args)?)?, call_expr)?;
-        self.lisp.boolean(cmp(a, b)).map_err(Into::into)
-    }
+    // NOTE: Old recursive force() and apply_builtin() removed
+    // All evaluation now goes through the trampoline
     
     // ========================================================================
     // Convenience
