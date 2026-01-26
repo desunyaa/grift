@@ -1,6 +1,13 @@
-[package]
-name = "pwn_arena"
+[workspace]
+resolver = "2"
+members = [
+    "crates/pwn_arena",
+    "crates/lisp_parser",
+    "crates/lisp_eval",
+    "crates/lisp_repl",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]
+license = "MIT OR Apache-2.0"

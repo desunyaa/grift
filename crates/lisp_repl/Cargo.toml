@@ -1,0 +1,15 @@
+[package]
+name = "lisp_repl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lisp REPL for the pwn_arena workspace"
+
+[[bin]]
+name = "lisp"
+path = "src/main.rs"
+
+[dependencies]
+pwn_arena = { path = "../pwn_arena" }
+lisp_parser = { path = "../lisp_parser" }
+lisp_eval = { path = "../lisp_eval" }
