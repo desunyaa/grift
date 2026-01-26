@@ -9,15 +9,20 @@
 //! - Symbols are linked lists of `Char` values (classic Lisp style)
 //! - All values are stored in a `pwn_arena` arena
 //! - Supports garbage collection via the `Trace` trait
+//! - Explicit boolean values (#t, #f) separate from nil/empty list
+//! - Call-by-need via Thunks (delayed computations)
 //!
 //! ## Value Representation
 //!
-//! - `Nil` - The empty list / false
+//! - `Nil` - The empty list (NOT false!)
+//! - `True` - Boolean true (#t)
+//! - `False` - Boolean false (#f)
 //! - `Number(i64)` - Integer numbers
 //! - `Char(char)` - Single character
 //! - `Cons { car, cdr }` - Pair/list cell
 //! - `Symbol { chars }` - Symbol (tagged char list)
 //! - `Lambda { params, body, env }` - Closure
+//! - `Thunk { expr, env, cached }` - Delayed computation (call-by-need)
 //! - `Builtin(Builtin)` - Optimized built-in function
 
 pub use pwn_arena::{Arena, ArenaIndex, ArenaError, ArenaResult, Trace, GcStats};
@@ -30,12 +35,22 @@ pub enum Builtin {
     Cdr,
     Cons,
     List,
+    SetCar,  // Mutation!
+    SetCdr,  // Mutation!
     
     // Predicates
     Atom,
     Eq,
     Null,
+    Pairp,
     Numberp,
+    Booleanp,
+    Procedurep,
+    Symbolp,
+    
+    // Lazy evaluation
+    Force,
+    Promisep,
     
     // Arithmetic
     Add,
@@ -51,9 +66,16 @@ pub enum Builtin {
     Ge,
     NumEq,
     
+    // Boolean operations
+    Not,
+    
     // I/O (for REPL)
     Print,
     Newline,
+    Display,
+    
+    // Error handling
+    Error,
 }
 
 impl Builtin {
@@ -64,10 +86,18 @@ impl Builtin {
             Builtin::Cdr => "cdr",
             Builtin::Cons => "cons",
             Builtin::List => "list",
+            Builtin::SetCar => "set-car!",
+            Builtin::SetCdr => "set-cdr!",
             Builtin::Atom => "atom",
             Builtin::Eq => "eq",
-            Builtin::Null => "null",
-            Builtin::Numberp => "numberp",
+            Builtin::Null => "null?",
+            Builtin::Pairp => "pair?",
+            Builtin::Numberp => "number?",
+            Builtin::Booleanp => "boolean?",
+            Builtin::Procedurep => "procedure?",
+            Builtin::Symbolp => "symbol?",
+            Builtin::Force => "force",
+            Builtin::Promisep => "promise?",
             Builtin::Add => "+",
             Builtin::Sub => "-",
             Builtin::Mul => "*",
@@ -78,26 +108,40 @@ impl Builtin {
             Builtin::Le => "<=",
             Builtin::Ge => ">=",
             Builtin::NumEq => "=",
+            Builtin::Not => "not",
             Builtin::Print => "print",
             Builtin::Newline => "newline",
+            Builtin::Display => "display",
+            Builtin::Error => "error",
         }
     }
     
     /// All builtins for initialization
     pub const ALL: &'static [Builtin] = &[
         Builtin::Car, Builtin::Cdr, Builtin::Cons, Builtin::List,
-        Builtin::Atom, Builtin::Eq, Builtin::Null, Builtin::Numberp,
+        Builtin::SetCar, Builtin::SetCdr,
+        Builtin::Atom, Builtin::Eq, Builtin::Null, Builtin::Pairp,
+        Builtin::Numberp, Builtin::Booleanp, Builtin::Procedurep, Builtin::Symbolp,
+        Builtin::Force, Builtin::Promisep,
         Builtin::Add, Builtin::Sub, Builtin::Mul, Builtin::Div, Builtin::Mod,
         Builtin::Lt, Builtin::Gt, Builtin::Le, Builtin::Ge, Builtin::NumEq,
-        Builtin::Print, Builtin::Newline,
+        Builtin::Not,
+        Builtin::Print, Builtin::Newline, Builtin::Display,
+        Builtin::Error,
     ];
 }
 
 /// A Lisp value
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Value {
-    /// The empty list / false value
+    /// The empty list (NOT false - use False for that)
     Nil,
+    
+    /// Boolean true (#t)
+    True,
+    
+    /// Boolean false (#f) - the ONLY false value
+    False,
     
     /// Integer number
     Number(i64),
@@ -123,15 +167,42 @@ pub enum Value {
         env: ArenaIndex,     // Captured environment (alist)
     },
     
+    /// Thunk - delayed computation for call-by-need
+    /// Created by (delay expr), forced by (force thunk)
+    Thunk {
+        expr: ArenaIndex,    // Unevaluated expression
+        env: ArenaIndex,     // Environment for evaluation
+        cached: ArenaIndex,  // Cached result (NULL if not yet evaluated)
+    },
+    
     /// Built-in function (optimized)
     Builtin(Builtin),
 }
 
 impl Value {
-    /// Check if this value is nil
+    /// Check if this value is nil (empty list)
     #[inline]
     pub const fn is_nil(&self) -> bool {
         matches!(self, Value::Nil)
+    }
+    
+    /// Check if this value is false (#f)
+    /// This is the ONLY way to be false in this Lisp
+    #[inline]
+    pub const fn is_false(&self) -> bool {
+        matches!(self, Value::False)
+    }
+    
+    /// Check if this value is true (#t)
+    #[inline]
+    pub const fn is_true(&self) -> bool {
+        matches!(self, Value::True)
+    }
+    
+    /// Check if this value is a boolean (#t or #f)
+    #[inline]
+    pub const fn is_boolean(&self) -> bool {
+        matches!(self, Value::True | Value::False)
     }
     
     /// Check if this value is an atom (not a cons cell)
@@ -152,7 +223,7 @@ impl Value {
         matches!(self, Value::Symbol { .. })
     }
     
-    /// Check if this value is a cons cell
+    /// Check if this value is a cons cell (pair)
     #[inline]
     pub const fn is_cons(&self) -> bool {
         matches!(self, Value::Cons { .. })
@@ -168,6 +239,18 @@ impl Value {
     #[inline]
     pub const fn is_builtin(&self) -> bool {
         matches!(self, Value::Builtin(_))
+    }
+    
+    /// Check if this value is a procedure (lambda or builtin)
+    #[inline]
+    pub const fn is_procedure(&self) -> bool {
+        matches!(self, Value::Lambda { .. } | Value::Builtin(_))
+    }
+    
+    /// Check if this value is a thunk (promise)
+    #[inline]
+    pub const fn is_thunk(&self) -> bool {
+        matches!(self, Value::Thunk { .. })
     }
     
     /// Get the number value if this is a number
@@ -187,13 +270,29 @@ impl Value {
             _ => None,
         }
     }
+    
+    /// Get a human-readable type name
+    pub const fn type_name(&self) -> &'static str {
+        match self {
+            Value::Nil => "nil",
+            Value::True | Value::False => "boolean",
+            Value::Number(_) => "number",
+            Value::Char(_) => "char",
+            Value::Cons { .. } => "pair",
+            Value::Symbol { .. } => "symbol",
+            Value::Lambda { .. } => "procedure",
+            Value::Thunk { .. } => "promise",
+            Value::Builtin(_) => "procedure",
+        }
+    }
 }
 
 /// Implement Trace for GC support
 impl<const N: usize> Trace<Value, N> for Value {
     fn trace<F: FnMut(ArenaIndex)>(&self, mut tracer: F) {
         match self {
-            Value::Nil | Value::Number(_) | Value::Char(_) | Value::Builtin(_) => {
+            Value::Nil | Value::True | Value::False | 
+            Value::Number(_) | Value::Char(_) | Value::Builtin(_) => {
                 // No references
             }
             Value::Cons { car, cdr } => {
@@ -207,6 +306,13 @@ impl<const N: usize> Trace<Value, N> for Value {
                 tracer(*params);
                 tracer(*body);
                 tracer(*env);
+            }
+            Value::Thunk { expr, env, cached } => {
+                tracer(*expr);
+                tracer(*env);
+                if !cached.is_null() {
+                    tracer(*cached);
+                }
             }
         }
     }
@@ -252,10 +358,28 @@ impl<const N: usize> Lisp<N> {
         self.arena.set(index, value)
     }
     
-    /// Allocate Nil
+    /// Allocate Nil (empty list)
     #[inline]
     pub fn nil(&self) -> ArenaResult<ArenaIndex> {
         self.alloc(Value::Nil)
+    }
+    
+    /// Allocate True (#t)
+    #[inline]
+    pub fn true_val(&self) -> ArenaResult<ArenaIndex> {
+        self.alloc(Value::True)
+    }
+    
+    /// Allocate False (#f)
+    #[inline]
+    pub fn false_val(&self) -> ArenaResult<ArenaIndex> {
+        self.alloc(Value::False)
+    }
+    
+    /// Allocate a boolean based on a Rust bool
+    #[inline]
+    pub fn boolean(&self, b: bool) -> ArenaResult<ArenaIndex> {
+        if b { self.true_val() } else { self.false_val() }
     }
     
     /// Allocate a number
@@ -294,10 +418,28 @@ impl<const N: usize> Lisp<N> {
         }
     }
     
+    /// Set car of a cons cell (mutation!)
+    pub fn set_car(&self, index: ArenaIndex, new_car: ArenaIndex) -> ArenaResult<()> {
+        match self.get(index)? {
+            Value::Cons { cdr, .. } => {
+                self.set(index, Value::Cons { car: new_car, cdr })
+            }
+            _ => Err(ArenaError::InvalidIndex),
+        }
+    }
+    
+    /// Set cdr of a cons cell (mutation!)
+    pub fn set_cdr(&self, index: ArenaIndex, new_cdr: ArenaIndex) -> ArenaResult<()> {
+        match self.get(index)? {
+            Value::Cons { car, .. } => {
+                self.set(index, Value::Cons { car, cdr: new_cdr })
+            }
+            _ => Err(ArenaError::InvalidIndex),
+        }
+    }
+    
     /// Create a symbol from a string slice (builds char list)
     pub fn symbol(&self, name: &str) -> ArenaResult<ArenaIndex> {
-        // Build linked list of chars in reverse, then it's already correct
-        // because we build from the end
         let mut chars = self.nil()?;
         
         // Build in reverse order
@@ -333,6 +475,11 @@ impl<const N: usize> Lisp<N> {
         self.alloc(Value::Lambda { params, body, env })
     }
     
+    /// Allocate a thunk (delayed computation)
+    pub fn thunk(&self, expr: ArenaIndex, env: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        self.alloc(Value::Thunk { expr, env, cached: ArenaIndex::NULL })
+    }
+    
     /// Build a list from an iterator of indices
     pub fn list<I: IntoIterator<Item = ArenaIndex>>(&self, items: I) -> ArenaResult<ArenaIndex>
     where
@@ -355,7 +502,7 @@ impl<const N: usize> Lisp<N> {
                     len += 1;
                     list = cdr;
                 }
-                _ => return Err(ArenaError::InvalidIndex), // Not a proper list
+                _ => return Err(ArenaError::InvalidIndex),
             }
         }
     }
@@ -431,6 +578,37 @@ impl<const N: usize> Lisp<N> {
         }
     }
     
+    /// Extract symbol name to a fixed buffer
+    pub fn symbol_to_bytes(&self, sym: ArenaIndex, buf: &mut [u8]) -> ArenaResult<usize> {
+        let val = self.get(sym)?;
+        
+        match val {
+            Value::Symbol { chars } => {
+                let mut list = chars;
+                let mut len = 0;
+                
+                loop {
+                    if len >= buf.len() {
+                        break;
+                    }
+                    match self.get(list)? {
+                        Value::Nil => break,
+                        Value::Cons { car, cdr } => {
+                            if let Value::Char(c) = self.get(car)? {
+                                buf[len] = c as u8;
+                                len += 1;
+                            }
+                            list = cdr;
+                        }
+                        _ => break,
+                    }
+                }
+                Ok(len)
+            }
+            _ => Ok(0),
+        }
+    }
+    
     /// Run garbage collection
     pub fn gc(&self, roots: &[ArenaIndex]) -> GcStats {
         self.arena.collect_garbage(roots)
@@ -457,9 +635,22 @@ impl<const N: usize> Default for Lisp<N> {
 // Parser
 // ============================================================================
 
-/// Parser error
+/// Source location for error reporting
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SourceLoc {
+    pub line: u32,
+    pub column: u32,
+}
+
+/// Parser error with location
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParseError {
+pub struct ParseError {
+    pub kind: ParseErrorKind,
+    pub loc: SourceLoc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseErrorKind {
     /// Unexpected end of input
     UnexpectedEof,
     /// Unexpected character
@@ -470,13 +661,24 @@ pub enum ParseError {
     NumberOverflow,
     /// Arena is full
     OutOfMemory,
+    /// Invalid hash literal
+    InvalidHashLiteral,
+}
+
+impl ParseError {
+    pub fn new(kind: ParseErrorKind, line: u32, column: u32) -> Self {
+        ParseError { kind, loc: SourceLoc { line, column } }
+    }
 }
 
 impl From<ArenaError> for ParseError {
     fn from(e: ArenaError) -> Self {
-        match e {
-            ArenaError::OutOfMemory => ParseError::OutOfMemory,
-            _ => ParseError::OutOfMemory, // Shouldn't happen during parsing
+        ParseError {
+            kind: match e {
+                ArenaError::OutOfMemory => ParseErrorKind::OutOfMemory,
+                _ => ParseErrorKind::OutOfMemory,
+            },
+            loc: SourceLoc::default(),
         }
     }
 }
@@ -485,6 +687,8 @@ impl From<ArenaError> for ParseError {
 pub struct Parser<'a> {
     input: &'a [u8],
     pos: usize,
+    line: u32,
+    column: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -493,12 +697,24 @@ impl<'a> Parser<'a> {
         Parser {
             input: input.as_bytes(),
             pos: 0,
+            line: 1,
+            column: 1,
         }
     }
     
     /// Create from bytes
     pub fn from_bytes(input: &'a [u8]) -> Self {
-        Parser { input, pos: 0 }
+        Parser { input, pos: 0, line: 1, column: 1 }
+    }
+    
+    /// Get current source location
+    fn loc(&self) -> SourceLoc {
+        SourceLoc { line: self.line, column: self.column }
+    }
+    
+    /// Create an error at current location
+    fn error(&self, kind: ParseErrorKind) -> ParseError {
+        ParseError { kind, loc: self.loc() }
     }
     
     /// Peek at the current character
@@ -506,10 +722,21 @@ impl<'a> Parser<'a> {
         self.input.get(self.pos).copied()
     }
     
+    /// Peek at the next character (lookahead)
+    fn peek_next(&self) -> Option<u8> {
+        self.input.get(self.pos + 1).copied()
+    }
+    
     /// Advance and return the current character
     fn advance(&mut self) -> Option<u8> {
         let c = self.peek()?;
         self.pos += 1;
+        if c == b'\n' {
+            self.line += 1;
+            self.column = 1;
+        } else {
+            self.column += 1;
+        }
         Some(c)
     }
     
@@ -545,11 +772,11 @@ impl<'a> Parser<'a> {
         self.skip_whitespace();
         
         match self.peek() {
-            None => Err(ParseError::UnexpectedEof),
+            None => Err(self.error(ParseErrorKind::UnexpectedEof)),
             
             Some(b'(') => self.parse_list(lisp),
             
-            Some(b')') => Err(ParseError::UnmatchedParen),
+            Some(b')') => Err(self.error(ParseErrorKind::UnmatchedParen)),
             
             Some(b'\'') => {
                 // Quote: 'x -> (quote x)
@@ -561,11 +788,13 @@ impl<'a> Parser<'a> {
                 lisp.cons(quote_sym, quoted).map_err(Into::into)
             }
             
+            Some(b'#') => self.parse_hash_literal(lisp),
+            
             Some(c) if c.is_ascii_digit() => self.parse_number(lisp),
             
             Some(b'-') => {
                 // Could be negative number or symbol
-                if self.input.get(self.pos + 1).map_or(false, |c| c.is_ascii_digit()) {
+                if self.peek_next().map_or(false, |c| c.is_ascii_digit()) {
                     self.parse_number(lisp)
                 } else {
                     self.parse_symbol(lisp)
@@ -574,7 +803,25 @@ impl<'a> Parser<'a> {
             
             Some(c) if Self::is_symbol_char(c) => self.parse_symbol(lisp),
             
-            Some(c) => Err(ParseError::UnexpectedChar(c as char)),
+            Some(c) => Err(self.error(ParseErrorKind::UnexpectedChar(c as char))),
+        }
+    }
+    
+    /// Parse hash literals (#t, #f, etc.)
+    fn parse_hash_literal<const N: usize>(&mut self, lisp: &Lisp<N>) -> Result<ArenaIndex, ParseError> {
+        self.advance(); // consume '#'
+        
+        match self.peek() {
+            Some(b't') | Some(b'T') => {
+                self.advance();
+                lisp.true_val().map_err(Into::into)
+            }
+            Some(b'f') | Some(b'F') => {
+                self.advance();
+                lisp.false_val().map_err(Into::into)
+            }
+            Some(_) => Err(self.error(ParseErrorKind::InvalidHashLiteral)),
+            None => Err(self.error(ParseErrorKind::UnexpectedEof)),
         }
     }
     
@@ -589,9 +836,7 @@ impl<'a> Parser<'a> {
         }
         
         // Parse elements and build list
-        // We need to build in order, so we use a temporary stack
-        // Since we're no_std, we use a fixed-size buffer
-        const MAX_LIST_DEPTH: usize = 64;
+        const MAX_LIST_DEPTH: usize = 128;
         let mut elements: [ArenaIndex; MAX_LIST_DEPTH] = [ArenaIndex::NULL; MAX_LIST_DEPTH];
         let mut count = 0;
         
@@ -599,7 +844,7 @@ impl<'a> Parser<'a> {
             self.skip_whitespace();
             
             match self.peek() {
-                None => return Err(ParseError::UnexpectedEof),
+                None => return Err(self.error(ParseErrorKind::UnexpectedEof)),
                 Some(b')') => {
                     self.advance();
                     break;
@@ -610,14 +855,14 @@ impl<'a> Parser<'a> {
                     self.skip_whitespace();
                     
                     if count == 0 {
-                        return Err(ParseError::UnexpectedChar('.'));
+                        return Err(self.error(ParseErrorKind::UnexpectedChar('.')));
                     }
                     
                     let cdr = self.parse(lisp)?;
                     self.skip_whitespace();
                     
                     if self.advance() != Some(b')') {
-                        return Err(ParseError::UnmatchedParen);
+                        return Err(self.error(ParseErrorKind::UnmatchedParen));
                     }
                     
                     // Build the dotted list
@@ -629,7 +874,7 @@ impl<'a> Parser<'a> {
                 }
                 Some(_) => {
                     if count >= MAX_LIST_DEPTH {
-                        return Err(ParseError::OutOfMemory);
+                        return Err(self.error(ParseErrorKind::OutOfMemory));
                     }
                     elements[count] = self.parse(lisp)?;
                     count += 1;
@@ -660,7 +905,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 value = value.checked_mul(10)
                     .and_then(|v| v.checked_add((c - b'0') as i64))
-                    .ok_or(ParseError::NumberOverflow)?;
+                    .ok_or_else(|| self.error(ParseErrorKind::NumberOverflow))?;
             } else {
                 break;
             }
@@ -695,9 +940,9 @@ impl<'a> Parser<'a> {
         if name == b"nil" {
             return lisp.nil().map_err(Into::into);
         }
-        if name == b"t" {
-            return lisp.symbol("t").map_err(Into::into);
-        }
+        // Note: #t and #f are now the canonical booleans
+        // but we can still allow 'true' and 'false' as symbols that 
+        // the evaluator can bind to #t and #f
         
         lisp.symbol_from_bytes(name).map_err(Into::into)
     }
@@ -706,6 +951,11 @@ impl<'a> Parser<'a> {
     pub fn has_more(&mut self) -> bool {
         self.skip_whitespace();
         self.peek().is_some()
+    }
+    
+    /// Get current position for error reporting
+    pub fn position(&self) -> (u32, u32) {
+        (self.line, self.column)
     }
 }
 
@@ -773,6 +1023,23 @@ mod tests {
     }
     
     #[test]
+    fn test_parse_booleans() {
+        let lisp: Lisp<100> = Lisp::new();
+        
+        let idx = parse(&lisp, "#t").unwrap();
+        assert_eq!(lisp.get(idx).unwrap(), Value::True);
+        
+        let idx = parse(&lisp, "#f").unwrap();
+        assert_eq!(lisp.get(idx).unwrap(), Value::False);
+        
+        let idx = parse(&lisp, "#T").unwrap();
+        assert_eq!(lisp.get(idx).unwrap(), Value::True);
+        
+        let idx = parse(&lisp, "#F").unwrap();
+        assert_eq!(lisp.get(idx).unwrap(), Value::False);
+    }
+    
+    #[test]
     fn test_parse_list() {
         let lisp: Lisp<100> = Lisp::new();
         
@@ -819,6 +1086,24 @@ mod tests {
     }
     
     #[test]
+    fn test_set_car_cdr() {
+        let lisp: Lisp<100> = Lisp::new();
+        
+        let a = lisp.number(1).unwrap();
+        let b = lisp.number(2).unwrap();
+        let c = lisp.number(3).unwrap();
+        let pair = lisp.cons(a, b).unwrap();
+        
+        // Mutate car
+        lisp.set_car(pair, c).unwrap();
+        assert_eq!(lisp.get(lisp.car(pair).unwrap()).unwrap(), Value::Number(3));
+        
+        // Mutate cdr
+        lisp.set_cdr(pair, a).unwrap();
+        assert_eq!(lisp.get(lisp.cdr(pair).unwrap()).unwrap(), Value::Number(1));
+    }
+    
+    #[test]
     fn test_gc() {
         let lisp: Lisp<100> = Lisp::new();
         
@@ -831,5 +1116,16 @@ mod tests {
         
         let stats = lisp.gc(&[root]);
         assert!(stats.collected > 0);
+    }
+    
+    #[test]
+    fn test_thunk_creation() {
+        let lisp: Lisp<100> = Lisp::new();
+        
+        let expr = lisp.number(42).unwrap();
+        let env = lisp.nil().unwrap();
+        let thunk = lisp.thunk(expr, env).unwrap();
+        
+        assert!(lisp.get(thunk).unwrap().is_thunk());
     }
 }

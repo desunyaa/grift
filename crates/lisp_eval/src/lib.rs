@@ -2,31 +2,48 @@
 
 //! # Lisp Evaluator
 //!
-//! A classic Lisp evaluator with lexically scoped closures.
+//! A classic Lisp evaluator with:
+//! - Lexically scoped closures
+//! - Tail Call Optimization (TCO)
+//! - Call-by-need (lazy evaluation via delay/force)
+//! - Full mutation (set-car!, set-cdr!)
+//! - Rich error handling with stack traces
 //!
-//! ## Environment
+//! ## Truthiness
 //!
-//! Environments are association lists: `((name . value) (name . value) ...)`
+//! Only `#f` is false. Everything else (including `nil`/`'()`) is truthy.
 //!
 //! ## Special Forms
 //!
 //! - `quote` - Return expression unevaluated
-//! - `if` - Conditional
-//! - `cond` - Multi-way conditional
+//! - `if` - Conditional (TCO in branches)
+//! - `cond` - Multi-way conditional (TCO in last branch)
 //! - `lambda` - Create closure
 //! - `define` - Define variable/function
 //! - `let` - Local binding
-//! - `begin` - Sequence of expressions
-//! - `set!` - Mutation
+//! - `let*` - Sequential local binding
+//! - `begin` - Sequence of expressions (TCO in last)
+//! - `set!` - Mutation of bindings
+//! - `and` / `or` - Short-circuit boolean operations
+//! - `delay` - Create a thunk (lazy evaluation)
 
 pub use lisp_parser::{
     Arena, ArenaIndex, ArenaError, ArenaResult, Trace, GcStats,
-    Value, Builtin, Lisp, ParseError, parse,
+    Value, Builtin, Lisp, ParseError, ParseErrorKind, SourceLoc, parse,
 };
 
-/// Evaluation error
+// ============================================================================
+// Error Handling
+// ============================================================================
+
+/// Maximum call stack depth for traces
+const MAX_STACK_DEPTH: usize = 64;
+/// Maximum frames to include in error backtrace
+const MAX_BACKTRACE: usize = 16;
+
+/// Error kind enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EvalError {
+pub enum ErrorKind {
     /// Arena is full
     OutOfMemory,
     /// Unbound variable
@@ -35,42 +52,201 @@ pub enum EvalError {
     NotAFunction,
     /// Wrong number of arguments
     WrongArgCount,
-    /// Type error (e.g., car of non-list)
+    /// Type error
     TypeError,
     /// Division by zero
     DivisionByZero,
     /// Parse error
-    ParseError(ParseError),
+    Parse,
+    /// User-raised error
+    UserError,
+    /// Stack overflow (recursion too deep)
+    StackOverflow,
+    /// Cannot mutate non-pair
+    NotAPair,
     /// Generic error
-    Error,
+    Generic,
+}
+
+impl ErrorKind {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            ErrorKind::OutOfMemory => "out of memory",
+            ErrorKind::UnboundVariable => "unbound variable",
+            ErrorKind::NotAFunction => "not a function",
+            ErrorKind::WrongArgCount => "wrong number of arguments",
+            ErrorKind::TypeError => "type error",
+            ErrorKind::DivisionByZero => "division by zero",
+            ErrorKind::Parse => "parse error",
+            ErrorKind::UserError => "error",
+            ErrorKind::StackOverflow => "stack overflow",
+            ErrorKind::NotAPair => "not a pair",
+            ErrorKind::Generic => "error",
+        }
+    }
+}
+
+/// A stack frame for error reporting
+#[derive(Clone, Copy, Debug)]
+pub struct StackFrame {
+    /// The expression being evaluated (for display)
+    pub expr: ArenaIndex,
+    /// Function being called (if applicable)
+    pub func: ArenaIndex,
+}
+
+impl Default for StackFrame {
+    fn default() -> Self {
+        StackFrame {
+            expr: ArenaIndex::NULL,
+            func: ArenaIndex::NULL,
+        }
+    }
+}
+
+/// Evaluation error with context
+#[derive(Debug)]
+pub struct EvalError {
+    /// What kind of error
+    pub kind: ErrorKind,
+    /// Human-readable message context
+    pub message: ErrorMessage,
+    /// The expression that caused the error
+    pub expr: ArenaIndex,
+    /// Expected type (for type errors)
+    pub expected: Option<&'static str>,
+    /// Got type (for type errors)
+    pub got: Option<&'static str>,
+    /// Expected argument count
+    pub expected_args: Option<usize>,
+    /// Got argument count
+    pub got_args: Option<usize>,
+    /// Call stack backtrace
+    pub backtrace: [StackFrame; MAX_BACKTRACE],
+    pub backtrace_len: usize,
+    /// Original parse error (if applicable)
+    pub parse_error: Option<ParseError>,
+}
+
+/// Fixed-size message buffer for no_std
+#[derive(Debug, Clone, Copy)]
+pub struct ErrorMessage {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl ErrorMessage {
+    pub const fn empty() -> Self {
+        ErrorMessage { buf: [0; 64], len: 0 }
+    }
+    
+    pub fn from_str(s: &str) -> Self {
+        let mut msg = ErrorMessage::empty();
+        let bytes = s.as_bytes();
+        let len = bytes.len().min(64);
+        msg.buf[..len].copy_from_slice(&bytes[..len]);
+        msg.len = len;
+        msg
+    }
+    
+    pub fn as_str(&self) -> &str {
+        // Safety: we only store valid UTF-8
+        unsafe { core::str::from_utf8_unchecked(&self.buf[..self.len]) }
+    }
+}
+
+impl Default for ErrorMessage {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl EvalError {
+    pub fn new(kind: ErrorKind) -> Self {
+        EvalError {
+            kind,
+            message: ErrorMessage::empty(),
+            expr: ArenaIndex::NULL,
+            expected: None,
+            got: None,
+            expected_args: None,
+            got_args: None,
+            backtrace: [StackFrame::default(); MAX_BACKTRACE],
+            backtrace_len: 0,
+            parse_error: None,
+        }
+    }
+    
+    pub fn with_expr(mut self, expr: ArenaIndex) -> Self {
+        self.expr = expr;
+        self
+    }
+    
+    pub fn with_message(mut self, msg: &str) -> Self {
+        self.message = ErrorMessage::from_str(msg);
+        self
+    }
+    
+    pub fn with_types(mut self, expected: &'static str, got: &'static str) -> Self {
+        self.expected = Some(expected);
+        self.got = Some(got);
+        self
+    }
+    
+    pub fn with_args(mut self, expected: usize, got: usize) -> Self {
+        self.expected_args = Some(expected);
+        self.got_args = Some(got);
+        self
+    }
+    
+    pub fn with_backtrace(mut self, stack: &[StackFrame], len: usize) -> Self {
+        let copy_len = len.min(MAX_BACKTRACE);
+        self.backtrace[..copy_len].copy_from_slice(&stack[..copy_len]);
+        self.backtrace_len = copy_len;
+        self
+    }
 }
 
 impl From<ArenaError> for EvalError {
     fn from(e: ArenaError) -> Self {
         match e {
-            ArenaError::OutOfMemory => EvalError::OutOfMemory,
-            _ => EvalError::Error,
+            ArenaError::OutOfMemory => EvalError::new(ErrorKind::OutOfMemory),
+            _ => EvalError::new(ErrorKind::Generic),
         }
     }
 }
 
 impl From<ParseError> for EvalError {
     fn from(e: ParseError) -> Self {
-        EvalError::ParseError(e)
+        let mut err = EvalError::new(ErrorKind::Parse);
+        err.parse_error = Some(e);
+        err
     }
 }
 
 /// Result type for evaluation
 pub type EvalResult = Result<ArenaIndex, EvalError>;
 
-/// The Lisp evaluator
+/// Result for TCO helper functions (internal)
+enum TcoResult {
+    /// Return this value immediately
+    Return(ArenaIndex),
+    /// Continue evaluation with new expression and environment (tail call)
+    TailCall { new_expr: ArenaIndex, new_env: ArenaIndex },
+}
+
+// ============================================================================
+// Evaluator
+// ============================================================================
+
+/// The Lisp evaluator with TCO support
 pub struct Evaluator<'a, const N: usize> {
     lisp: &'a Lisp<N>,
     /// Global environment
     global_env: ArenaIndex,
-    /// Roots for GC (global env + any temps)
-    gc_roots: [ArenaIndex; 32],
-    gc_root_count: usize,
+    /// Call stack for error reporting
+    call_stack: [StackFrame; MAX_STACK_DEPTH],
+    call_stack_depth: usize,
 }
 
 impl<'a, const N: usize> Evaluator<'a, N> {
@@ -79,8 +255,8 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         let mut eval = Evaluator {
             lisp,
             global_env: ArenaIndex::NULL,
-            gc_roots: [ArenaIndex::NULL; 32],
-            gc_root_count: 0,
+            call_stack: [StackFrame::default(); MAX_STACK_DEPTH],
+            call_stack_depth: 0,
         };
         
         // Initialize global environment with builtins
@@ -92,9 +268,14 @@ impl<'a, const N: usize> Evaluator<'a, N> {
             eval.global_env = eval.env_extend(eval.global_env, name, val)?;
         }
         
-        // Add 't' as true
-        let t = lisp.symbol("t")?;
-        eval.global_env = eval.env_extend(eval.global_env, t, t)?;
+        // Add 'true' and 'false' as aliases for #t and #f
+        let true_sym = lisp.symbol("true")?;
+        let true_val = lisp.true_val()?;
+        eval.global_env = eval.env_extend(eval.global_env, true_sym, true_val)?;
+        
+        let false_sym = lisp.symbol("false")?;
+        let false_val = lisp.false_val()?;
+        eval.global_env = eval.env_extend(eval.global_env, false_sym, false_val)?;
         
         Ok(eval)
     }
@@ -104,20 +285,54 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         self.lisp
     }
     
-    /// Get the global environment root
+    /// Get the global environment
     pub fn global_env(&self) -> ArenaIndex {
         self.global_env
     }
     
     /// Run GC with current roots
     pub fn gc(&self) -> GcStats {
-        let mut roots = [ArenaIndex::NULL; 33];
-        roots[0] = self.global_env;
-        for i in 0..self.gc_root_count {
-            roots[i + 1] = self.gc_roots[i];
-        }
-        self.lisp.gc(&roots[..self.gc_root_count + 1])
+        self.lisp.gc(&[self.global_env])
     }
+    
+    // ========================================================================
+    // Stack Management
+    // ========================================================================
+    
+    fn push_frame(&mut self, expr: ArenaIndex, func: ArenaIndex) -> Result<(), EvalError> {
+        if self.call_stack_depth >= MAX_STACK_DEPTH {
+            return Err(self.make_error(ErrorKind::StackOverflow, expr));
+        }
+        self.call_stack[self.call_stack_depth] = StackFrame { expr, func };
+        self.call_stack_depth += 1;
+        Ok(())
+    }
+    
+    fn pop_frame(&mut self) {
+        if self.call_stack_depth > 0 {
+            self.call_stack_depth -= 1;
+        }
+    }
+    
+    fn make_error(&self, kind: ErrorKind, expr: ArenaIndex) -> EvalError {
+        EvalError::new(kind)
+            .with_expr(expr)
+            .with_backtrace(&self.call_stack, self.call_stack_depth)
+    }
+    
+    fn type_error(&self, expr: ArenaIndex, expected: &'static str, got: &'static str) -> EvalError {
+        self.make_error(ErrorKind::TypeError, expr)
+            .with_types(expected, got)
+    }
+    
+    fn arg_error(&self, expr: ArenaIndex, expected: usize, got: usize) -> EvalError {
+        self.make_error(ErrorKind::WrongArgCount, expr)
+            .with_args(expected, got)
+    }
+    
+    // ========================================================================
+    // Environment Management
+    // ========================================================================
     
     /// Extend an environment with a binding
     fn env_extend(&self, env: ArenaIndex, name: ArenaIndex, value: ArenaIndex) -> EvalResult {
@@ -131,9 +346,11 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         
         loop {
             match self.lisp.get(current)? {
-                Value::Nil => return Err(EvalError::UnboundVariable),
+                Value::Nil => {
+                    // Try global
+                    return self.env_lookup_global(name);
+                }
                 Value::Cons { car, cdr } => {
-                    // car is (name . value)
                     let binding = self.lisp.get(car)?;
                     if let Value::Cons { car: bound_name, cdr: bound_value } = binding {
                         if self.lisp.symbol_eq(bound_name, name)? {
@@ -142,39 +359,81 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                     }
                     current = cdr;
                 }
-                _ => return Err(EvalError::Error),
+                _ => return Err(self.make_error(ErrorKind::Generic, name)),
+            }
+        }
+    }
+    
+    /// Look up in global environment only
+    fn env_lookup_global(&self, name: ArenaIndex) -> EvalResult {
+        let mut current = self.global_env;
+        
+        loop {
+            match self.lisp.get(current)? {
+                Value::Nil => {
+                    return Err(self.make_error(ErrorKind::UnboundVariable, name));
+                }
+                Value::Cons { car, cdr } => {
+                    let binding = self.lisp.get(car)?;
+                    if let Value::Cons { car: bound_name, cdr: bound_value } = binding {
+                        if self.lisp.symbol_eq(bound_name, name)? {
+                            return Ok(bound_value);
+                        }
+                    }
+                    current = cdr;
+                }
+                _ => return Err(self.make_error(ErrorKind::Generic, name)),
             }
         }
     }
     
     /// Set a variable in the environment (mutation)
     fn env_set(&self, env: ArenaIndex, name: ArenaIndex, value: ArenaIndex) -> EvalResult {
+        // Try local first
         let mut current = env;
-        
         loop {
             match self.lisp.get(current)? {
-                Value::Nil => return Err(EvalError::UnboundVariable),
+                Value::Nil => break,
                 Value::Cons { car, cdr } => {
                     let binding = self.lisp.get(car)?;
                     if let Value::Cons { car: bound_name, cdr: _ } = binding {
                         if self.lisp.symbol_eq(bound_name, name)? {
-                            // Update the binding in place
                             self.lisp.set(car, Value::Cons { car: bound_name, cdr: value })?;
                             return Ok(value);
                         }
                     }
                     current = cdr;
                 }
-                _ => return Err(EvalError::Error),
+                _ => break,
+            }
+        }
+        
+        // Try global
+        let mut current = self.global_env;
+        loop {
+            match self.lisp.get(current)? {
+                Value::Nil => {
+                    return Err(self.make_error(ErrorKind::UnboundVariable, name));
+                }
+                Value::Cons { car, cdr } => {
+                    let binding = self.lisp.get(car)?;
+                    if let Value::Cons { car: bound_name, cdr: _ } = binding {
+                        if self.lisp.symbol_eq(bound_name, name)? {
+                            self.lisp.set(car, Value::Cons { car: bound_name, cdr: value })?;
+                            return Ok(value);
+                        }
+                    }
+                    current = cdr;
+                }
+                _ => return Err(self.make_error(ErrorKind::Generic, name)),
             }
         }
     }
     
     /// Define in global environment
     pub fn define(&mut self, name: ArenaIndex, value: ArenaIndex) -> EvalResult {
-        // Check if already defined and update, otherwise add
+        // Check if already defined and update
         let mut current = self.global_env;
-        
         loop {
             match self.lisp.get(current)? {
                 Value::Nil => {
@@ -193,143 +452,199 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                     }
                     current = cdr;
                 }
-                _ => return Err(EvalError::Error),
+                _ => return Err(self.make_error(ErrorKind::Generic, name)),
             }
         }
     }
     
-    /// Evaluate an expression
+    // ========================================================================
+    // Main Evaluation - TCO via Trampoline
+    // ========================================================================
+    
+    /// Evaluate an expression (entry point)
     pub fn eval(&mut self, expr: ArenaIndex) -> EvalResult {
         self.eval_in_env(expr, self.global_env)
     }
     
     /// Evaluate an expression in a given environment
-    fn eval_in_env(&mut self, expr: ArenaIndex, env: ArenaIndex) -> EvalResult {
-        let val = self.lisp.get(expr)?;
-        
-        match val {
-            // Self-evaluating
-            Value::Nil | Value::Number(_) | Value::Char(_) | 
-            Value::Builtin(_) | Value::Lambda { .. } => Ok(expr),
+    /// Uses a trampoline loop for TCO
+    fn eval_in_env(&mut self, mut expr: ArenaIndex, mut env: ArenaIndex) -> EvalResult {
+        loop {
+            let val = self.lisp.get(expr)?;
             
-            // Symbol - variable lookup
-            Value::Symbol { .. } => {
-                // Try local env first, then global
-                match self.env_lookup(env, expr) {
-                    Ok(v) => Ok(v),
-                    Err(EvalError::UnboundVariable) => self.env_lookup(self.global_env, expr),
-                    Err(e) => Err(e),
-                }
-            }
-            
-            // List - special form or function application
-            Value::Cons { car, cdr } => {
-                let head = self.lisp.get(car)?;
-                
-                // Check for special forms
-                if let Value::Symbol { .. } = head {
-                    // quote
-                    if self.lisp.symbol_matches(car, "quote")? {
-                        return Ok(self.lisp.car(cdr)?);
-                    }
-                    
-                    // if
-                    if self.lisp.symbol_matches(car, "if")? {
-                        return self.eval_if(cdr, env);
-                    }
-                    
-                    // cond
-                    if self.lisp.symbol_matches(car, "cond")? {
-                        return self.eval_cond(cdr, env);
-                    }
-                    
-                    // lambda
-                    if self.lisp.symbol_matches(car, "lambda")? {
-                        return self.eval_lambda(cdr, env);
-                    }
-                    
-                    // define
-                    if self.lisp.symbol_matches(car, "define")? {
-                        return self.eval_define(cdr, env);
-                    }
-                    
-                    // let
-                    if self.lisp.symbol_matches(car, "let")? {
-                        return self.eval_let(cdr, env);
-                    }
-                    
-                    // begin
-                    if self.lisp.symbol_matches(car, "begin")? {
-                        return self.eval_begin(cdr, env);
-                    }
-                    
-                    // set!
-                    if self.lisp.symbol_matches(car, "set!")? {
-                        return self.eval_set(cdr, env);
-                    }
-                    
-                    // and
-                    if self.lisp.symbol_matches(car, "and")? {
-                        return self.eval_and(cdr, env);
-                    }
-                    
-                    // or
-                    if self.lisp.symbol_matches(car, "or")? {
-                        return self.eval_or(cdr, env);
-                    }
+            match val {
+                // Self-evaluating values
+                Value::Nil | Value::True | Value::False | 
+                Value::Number(_) | Value::Char(_) | 
+                Value::Builtin(_) | Value::Lambda { .. } | Value::Thunk { .. } => {
+                    return Ok(expr);
                 }
                 
-                // Function application
-                let func = self.eval_in_env(car, env)?;
-                let args = self.eval_list(cdr, env)?;
-                self.apply(func, args)
+                // Symbol - variable lookup
+                Value::Symbol { .. } => {
+                    return self.env_lookup(env, expr);
+                }
+                
+                // List - special form or function application
+                Value::Cons { car, cdr } => {
+                    let head = self.lisp.get(car)?;
+                    
+                    // Check for special forms
+                    if let Value::Symbol { .. } = head {
+                        // quote
+                        if self.lisp.symbol_matches(car, "quote")? {
+                            return Ok(self.lisp.car(cdr)?);
+                        }
+                        
+                        // if - TCO in branches
+                        if self.lisp.symbol_matches(car, "if")? {
+                            let cond_expr = self.lisp.car(cdr)?;
+                            let rest = self.lisp.cdr(cdr)?;
+                            let then_expr = self.lisp.car(rest)?;
+                            let else_rest = self.lisp.cdr(rest)?;
+                            
+                            // Evaluate condition (not tail position)
+                            let cond_val = self.eval_in_env(cond_expr, env)?;
+                            
+                            // Choose branch - THIS is tail position (continue loop)
+                            if !self.is_false(cond_val)? {
+                                expr = then_expr;
+                                continue;
+                            } else if !self.lisp.get(else_rest)?.is_nil() {
+                                expr = self.lisp.car(else_rest)?;
+                                continue;
+                            } else {
+                                return self.lisp.nil().map_err(Into::into);
+                            }
+                        }
+                        
+                        // cond - TCO in final clause
+                        if self.lisp.symbol_matches(car, "cond")? {
+                            match self.eval_cond_tco(cdr, env)? {
+                                TcoResult::Return(val) => return Ok(val),
+                                TcoResult::TailCall { new_expr, new_env } => {
+                                    expr = new_expr;
+                                    env = new_env;
+                                    continue;
+                                }
+                            }
+                        }
+                        
+                        // lambda
+                        if self.lisp.symbol_matches(car, "lambda")? {
+                            return self.eval_lambda(cdr, env);
+                        }
+                        
+                        // define
+                        if self.lisp.symbol_matches(car, "define")? {
+                            return self.eval_define(cdr, env);
+                        }
+                        
+                        // let - TCO in body
+                        if self.lisp.symbol_matches(car, "let")? {
+                            let (new_expr, new_env) = self.eval_let_tco(cdr, env)?;
+                            expr = new_expr;
+                            env = new_env;
+                            continue;
+                        }
+                        
+                        // let* - TCO in body
+                        if self.lisp.symbol_matches(car, "let*")? {
+                            let (new_expr, new_env) = self.eval_let_star_tco(cdr, env)?;
+                            expr = new_expr;
+                            env = new_env;
+                            continue;
+                        }
+                        
+                        // begin - TCO in last expression
+                        if self.lisp.symbol_matches(car, "begin")? {
+                            match self.eval_begin_tco(cdr, env)? {
+                                TcoResult::Return(val) => return Ok(val),
+                                TcoResult::TailCall { new_expr, new_env } => {
+                                    expr = new_expr;
+                                    env = new_env;
+                                    continue;
+                                }
+                            }
+                        }
+                        
+                        // set!
+                        if self.lisp.symbol_matches(car, "set!")? {
+                            return self.eval_set(cdr, env);
+                        }
+                        
+                        // and - short circuit
+                        if self.lisp.symbol_matches(car, "and")? {
+                            match self.eval_and_tco(cdr, env)? {
+                                TcoResult::Return(val) => return Ok(val),
+                                TcoResult::TailCall { new_expr, new_env } => {
+                                    expr = new_expr;
+                                    env = new_env;
+                                    continue;
+                                }
+                            }
+                        }
+                        
+                        // or - short circuit
+                        if self.lisp.symbol_matches(car, "or")? {
+                            match self.eval_or_tco(cdr, env)? {
+                                TcoResult::Return(val) => return Ok(val),
+                                TcoResult::TailCall { new_expr, new_env } => {
+                                    expr = new_expr;
+                                    env = new_env;
+                                    continue;
+                                }
+                            }
+                        }
+                        
+                        // delay - create thunk
+                        if self.lisp.symbol_matches(car, "delay")? {
+                            let delayed_expr = self.lisp.car(cdr)?;
+                            return self.lisp.thunk(delayed_expr, env).map_err(Into::into);
+                        }
+                    }
+                    
+                    // Function application
+                    self.push_frame(expr, car)?;
+                    
+                    let func = self.eval_in_env(car, env)?;
+                    let args = self.eval_list(cdr, env)?;
+                    
+                    match self.lisp.get(func)? {
+                        Value::Builtin(b) => {
+                            let result = self.apply_builtin(b, args, expr)?;
+                            self.pop_frame();
+                            return Ok(result);
+                        }
+                        Value::Lambda { params, body, env: closure_env } => {
+                            // TCO: set up for next iteration instead of recursing
+                            let new_env = self.bind_params(params, args, closure_env, expr)?;
+                            self.pop_frame();
+                            expr = body;
+                            env = new_env;
+                            continue;
+                        }
+                        _ => {
+                            self.pop_frame();
+                            return Err(self.type_error(car, "procedure", self.lisp.get(func)?.type_name()));
+                        }
+                    }
+                }
             }
         }
     }
     
-    /// Evaluate a list of expressions
-    fn eval_list(&mut self, list: ArenaIndex, env: ArenaIndex) -> EvalResult {
-        let val = self.lisp.get(list)?;
-        
-        match val {
-            Value::Nil => self.lisp.nil().map_err(Into::into),
-            Value::Cons { car, cdr } => {
-                let head = self.eval_in_env(car, env)?;
-                let tail = self.eval_list(cdr, env)?;
-                self.lisp.cons(head, tail).map_err(Into::into)
-            }
-            _ => Err(EvalError::TypeError),
-        }
-    }
+    // ========================================================================
+    // Special Form Helpers
+    // ========================================================================
     
-    /// Evaluate if special form
-    fn eval_if(&mut self, args: ArenaIndex, env: ArenaIndex) -> EvalResult {
-        let cond = self.lisp.car(args)?;
-        let rest = self.lisp.cdr(args)?;
-        let then_branch = self.lisp.car(rest)?;
-        let else_rest = self.lisp.cdr(rest)?;
-        
-        let cond_val = self.eval_in_env(cond, env)?;
-        
-        if !self.is_falsy(cond_val)? {
-            self.eval_in_env(then_branch, env)
-        } else {
-            // else branch is optional
-            match self.lisp.get(else_rest)? {
-                Value::Nil => self.lisp.nil().map_err(Into::into),
-                Value::Cons { car, .. } => self.eval_in_env(car, env),
-                _ => Err(EvalError::TypeError),
-            }
-        }
-    }
-    
-    /// Evaluate cond special form
-    fn eval_cond(&mut self, clauses: ArenaIndex, env: ArenaIndex) -> EvalResult {
+    /// Evaluate cond with TCO
+    fn eval_cond_tco(&mut self, clauses: ArenaIndex, env: ArenaIndex) -> Result<TcoResult, EvalError> {
         let mut current = clauses;
         
         loop {
             match self.lisp.get(current)? {
-                Value::Nil => return self.lisp.nil().map_err(Into::into),
+                Value::Nil => return Ok(TcoResult::Return(self.lisp.nil()?)),
                 Value::Cons { car: clause, cdr: rest } => {
                     let test = self.lisp.car(clause)?;
                     let body = self.lisp.cdr(clause)?;
@@ -337,37 +652,181 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                     // Check for 'else' clause
                     let is_else = self.lisp.symbol_matches(test, "else").unwrap_or(false);
                     
-                    let test_val = if is_else {
-                        self.lisp.symbol("t")? // Always true
+                    let test_result = if is_else {
+                        self.lisp.true_val()?
                     } else {
                         self.eval_in_env(test, env)?
                     };
                     
-                    if !self.is_falsy(test_val)? {
-                        // Evaluate body expressions
-                        return self.eval_begin(body, env);
+                    if !self.is_false(test_result)? {
+                        // Evaluate body - last expr is tail position
+                        return self.eval_begin_tco(body, env);
                     }
                     
                     current = rest;
                 }
-                _ => return Err(EvalError::TypeError),
+                _ => return Err(self.make_error(ErrorKind::TypeError, clauses)),
             }
         }
     }
     
-    /// Evaluate lambda special form
+    /// Evaluate begin with TCO
+    fn eval_begin_tco(&mut self, exprs: ArenaIndex, env: ArenaIndex) -> Result<TcoResult, EvalError> {
+        let mut current = exprs;
+        
+        loop {
+            match self.lisp.get(current)? {
+                Value::Nil => return Ok(TcoResult::Return(self.lisp.nil()?)),
+                Value::Cons { car: expr, cdr: rest } => {
+                    if self.lisp.get(rest)?.is_nil() {
+                        // Last expression - tail position
+                        return Ok(TcoResult::TailCall { new_expr: expr, new_env: env });
+                    } else {
+                        // Not last - evaluate and continue
+                        self.eval_in_env(expr, env)?;
+                        current = rest;
+                    }
+                }
+                _ => return Err(self.make_error(ErrorKind::TypeError, current)),
+            }
+        }
+    }
+    
+    /// Evaluate and with TCO
+    fn eval_and_tco(&mut self, args: ArenaIndex, env: ArenaIndex) -> Result<TcoResult, EvalError> {
+        let mut current = args;
+        
+        // Empty and returns #t
+        if self.lisp.get(current)?.is_nil() {
+            return Ok(TcoResult::Return(self.lisp.true_val()?));
+        }
+        
+        loop {
+            match self.lisp.get(current)? {
+                Value::Nil => return Ok(TcoResult::Return(self.lisp.true_val()?)),
+                Value::Cons { car: expr, cdr: rest } => {
+                    if self.lisp.get(rest)?.is_nil() {
+                        // Last expression - tail position
+                        return Ok(TcoResult::TailCall { new_expr: expr, new_env: env });
+                    } else {
+                        let result = self.eval_in_env(expr, env)?;
+                        if self.is_false(result)? {
+                            return Ok(TcoResult::Return(self.lisp.false_val()?));
+                        }
+                        current = rest;
+                    }
+                }
+                _ => return Err(self.make_error(ErrorKind::TypeError, current)),
+            }
+        }
+    }
+    
+    /// Evaluate or with TCO
+    fn eval_or_tco(&mut self, args: ArenaIndex, env: ArenaIndex) -> Result<TcoResult, EvalError> {
+        let mut current = args;
+        
+        // Empty or returns #f
+        if self.lisp.get(current)?.is_nil() {
+            return Ok(TcoResult::Return(self.lisp.false_val()?));
+        }
+        
+        loop {
+            match self.lisp.get(current)? {
+                Value::Nil => return Ok(TcoResult::Return(self.lisp.false_val()?)),
+                Value::Cons { car: expr, cdr: rest } => {
+                    if self.lisp.get(rest)?.is_nil() {
+                        // Last expression - tail position
+                        return Ok(TcoResult::TailCall { new_expr: expr, new_env: env });
+                    } else {
+                        let result = self.eval_in_env(expr, env)?;
+                        if !self.is_false(result)? {
+                            return Ok(TcoResult::Return(result));
+                        }
+                        current = rest;
+                    }
+                }
+                _ => return Err(self.make_error(ErrorKind::TypeError, current)),
+            }
+        }
+    }
+    
+    /// Evaluate let with TCO in body
+    fn eval_let_tco(&mut self, args: ArenaIndex, env: ArenaIndex) -> Result<(ArenaIndex, ArenaIndex), EvalError> {
+        let bindings = self.lisp.car(args)?;
+        let body = self.lisp.cdr(args)?;
+        
+        // Extend environment with all bindings
+        let mut new_env = env;
+        let mut current = bindings;
+        
+        loop {
+            match self.lisp.get(current)? {
+                Value::Nil => break,
+                Value::Cons { car: binding, cdr: rest } => {
+                    let name = self.lisp.car(binding)?;
+                    let value_expr = self.lisp.car(self.lisp.cdr(binding)?)?;
+                    let value = self.eval_in_env(value_expr, env)?; // Use original env
+                    new_env = self.env_extend(new_env, name, value)?;
+                    current = rest;
+                }
+                _ => return Err(self.make_error(ErrorKind::TypeError, bindings)),
+            }
+        }
+        
+        // Body becomes a begin block for TCO
+        let body_expr = if self.lisp.get(self.lisp.cdr(body)?)?.is_nil() {
+            self.lisp.car(body)?
+        } else {
+            // Wrap in begin
+            let begin = self.lisp.symbol("begin")?;
+            self.lisp.cons(begin, body)?
+        };
+        
+        Ok((body_expr, new_env))
+    }
+    
+    /// Evaluate let* with TCO in body
+    fn eval_let_star_tco(&mut self, args: ArenaIndex, env: ArenaIndex) -> Result<(ArenaIndex, ArenaIndex), EvalError> {
+        let bindings = self.lisp.car(args)?;
+        let body = self.lisp.cdr(args)?;
+        
+        // Extend environment sequentially
+        let mut new_env = env;
+        let mut current = bindings;
+        
+        loop {
+            match self.lisp.get(current)? {
+                Value::Nil => break,
+                Value::Cons { car: binding, cdr: rest } => {
+                    let name = self.lisp.car(binding)?;
+                    let value_expr = self.lisp.car(self.lisp.cdr(binding)?)?;
+                    let value = self.eval_in_env(value_expr, new_env)?; // Use NEW env
+                    new_env = self.env_extend(new_env, name, value)?;
+                    current = rest;
+                }
+                _ => return Err(self.make_error(ErrorKind::TypeError, bindings)),
+            }
+        }
+        
+        let body_expr = if self.lisp.get(self.lisp.cdr(body)?)?.is_nil() {
+            self.lisp.car(body)?
+        } else {
+            let begin = self.lisp.symbol("begin")?;
+            self.lisp.cons(begin, body)?
+        };
+        
+        Ok((body_expr, new_env))
+    }
+    
+    /// Evaluate lambda
     fn eval_lambda(&mut self, args: ArenaIndex, env: ArenaIndex) -> EvalResult {
         let params = self.lisp.car(args)?;
         let body_list = self.lisp.cdr(args)?;
         
         // Wrap body in begin if multiple expressions
-        let body = self.lisp.car(body_list)?;
-        let rest = self.lisp.cdr(body_list)?;
-        
-        let body = if self.lisp.get(rest)?.is_nil() {
-            body
+        let body = if self.lisp.get(self.lisp.cdr(body_list)?)?.is_nil() {
+            self.lisp.car(body_list)?
         } else {
-            // Multiple body expressions - wrap in begin
             let begin = self.lisp.symbol("begin")?;
             self.lisp.cons(begin, body_list)?
         };
@@ -375,7 +834,7 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         self.lisp.lambda(params, body, env).map_err(Into::into)
     }
     
-    /// Evaluate define special form
+    /// Evaluate define
     fn eval_define(&mut self, args: ArenaIndex, env: ArenaIndex) -> EvalResult {
         let first = self.lisp.car(args)?;
         let rest = self.lisp.cdr(args)?;
@@ -389,187 +848,197 @@ impl<'a, const N: usize> Evaluator<'a, N> {
             }
             // (define (name params...) body...) -> (define name (lambda (params...) body...))
             Value::Cons { car: name, cdr: params } => {
-                let lambda_sym = self.lisp.symbol("lambda")?;
-                let lambda_body = self.lisp.cons(params, rest)?;
-                let lambda_expr = self.lisp.cons(lambda_sym, lambda_body)?;
-                let lambda = self.eval_in_env(lambda_expr, env)?;
+                let body_list = rest;
+                let body = if self.lisp.get(self.lisp.cdr(body_list)?)?.is_nil() {
+                    self.lisp.car(body_list)?
+                } else {
+                    let begin = self.lisp.symbol("begin")?;
+                    self.lisp.cons(begin, body_list)?
+                };
+                let lambda = self.lisp.lambda(params, body, env)?;
                 self.define(name, lambda)
             }
-            _ => Err(EvalError::TypeError),
+            _ => Err(self.type_error(first, "symbol or list", self.lisp.get(first)?.type_name())),
         }
     }
     
-    /// Evaluate let special form
-    fn eval_let(&mut self, args: ArenaIndex, env: ArenaIndex) -> EvalResult {
-        let bindings = self.lisp.car(args)?;
-        let body = self.lisp.cdr(args)?;
-        
-        // Extend environment with bindings
-        let mut new_env = env;
-        let mut current = bindings;
-        
-        loop {
-            match self.lisp.get(current)? {
-                Value::Nil => break,
-                Value::Cons { car: binding, cdr: rest } => {
-                    let name = self.lisp.car(binding)?;
-                    let value_expr = self.lisp.car(self.lisp.cdr(binding)?)?;
-                    let value = self.eval_in_env(value_expr, env)?;
-                    new_env = self.env_extend(new_env, name, value)?;
-                    current = rest;
-                }
-                _ => return Err(EvalError::TypeError),
-            }
-        }
-        
-        // Evaluate body in new environment
-        self.eval_begin(body, new_env)
-    }
-    
-    /// Evaluate begin special form (sequence)
-    fn eval_begin(&mut self, exprs: ArenaIndex, env: ArenaIndex) -> EvalResult {
-        let mut current = exprs;
-        let mut result = self.lisp.nil()?;
-        
-        loop {
-            match self.lisp.get(current)? {
-                Value::Nil => return Ok(result),
-                Value::Cons { car: expr, cdr: rest } => {
-                    result = self.eval_in_env(expr, env)?;
-                    current = rest;
-                }
-                _ => return Err(EvalError::TypeError),
-            }
-        }
-    }
-    
-    /// Evaluate set! special form
+    /// Evaluate set!
     fn eval_set(&mut self, args: ArenaIndex, env: ArenaIndex) -> EvalResult {
         let name = self.lisp.car(args)?;
         let value_expr = self.lisp.car(self.lisp.cdr(args)?)?;
         let value = self.eval_in_env(value_expr, env)?;
+        self.env_set(env, name, value)
+    }
+    
+    // ========================================================================
+    // Helpers
+    // ========================================================================
+    
+    /// Evaluate a list of expressions (for function arguments)
+    fn eval_list(&mut self, list: ArenaIndex, env: ArenaIndex) -> EvalResult {
+        let val = self.lisp.get(list)?;
         
-        // Try local env first, then global
-        match self.env_set(env, name, value) {
-            Ok(v) => Ok(v),
-            Err(EvalError::UnboundVariable) => {
-                // Try global
-                match self.env_set(self.global_env, name, value) {
-                    Ok(v) => Ok(v),
-                    Err(_) => Err(EvalError::UnboundVariable),
-                }
+        match val {
+            Value::Nil => self.lisp.nil().map_err(Into::into),
+            Value::Cons { car, cdr } => {
+                let head = self.eval_in_env(car, env)?;
+                let tail = self.eval_list(cdr, env)?;
+                self.lisp.cons(head, tail).map_err(Into::into)
             }
-            Err(e) => Err(e),
+            _ => Err(self.make_error(ErrorKind::TypeError, list)),
         }
     }
     
-    /// Evaluate and special form
-    fn eval_and(&mut self, args: ArenaIndex, env: ArenaIndex) -> EvalResult {
-        let mut current = args;
-        let mut result = self.lisp.symbol("t")?; // Default true
-        
-        loop {
-            match self.lisp.get(current)? {
-                Value::Nil => return Ok(result),
-                Value::Cons { car: expr, cdr: rest } => {
-                    result = self.eval_in_env(expr, env)?;
-                    if self.is_falsy(result)? {
-                        return self.lisp.nil().map_err(Into::into);
-                    }
-                    current = rest;
-                }
-                _ => return Err(EvalError::TypeError),
-            }
-        }
-    }
-    
-    /// Evaluate or special form
-    fn eval_or(&mut self, args: ArenaIndex, env: ArenaIndex) -> EvalResult {
-        let mut current = args;
+    /// Bind parameters to arguments
+    fn bind_params(&self, params: ArenaIndex, args: ArenaIndex, env: ArenaIndex, call_expr: ArenaIndex) -> EvalResult {
+        let mut new_env = env;
+        let mut params_cur = params;
+        let mut args_cur = args;
         
         loop {
-            match self.lisp.get(current)? {
-                Value::Nil => return self.lisp.nil().map_err(Into::into),
-                Value::Cons { car: expr, cdr: rest } => {
-                    let result = self.eval_in_env(expr, env)?;
-                    if !self.is_falsy(result)? {
-                        return Ok(result);
-                    }
-                    current = rest;
+            let p = self.lisp.get(params_cur)?;
+            let a = self.lisp.get(args_cur)?;
+            
+            match (p, a) {
+                (Value::Nil, Value::Nil) => break,
+                (Value::Cons { car: param, cdr: prest }, 
+                 Value::Cons { car: arg, cdr: arest }) => {
+                    new_env = self.env_extend(new_env, param, arg)?;
+                    params_cur = prest;
+                    args_cur = arest;
                 }
-                _ => return Err(EvalError::TypeError),
+                (Value::Nil, Value::Cons { .. }) => {
+                    // Too many arguments
+                    let expected = self.count_list(params)?;
+                    let got = self.count_list(args)?;
+                    return Err(self.arg_error(call_expr, expected, got));
+                }
+                (Value::Cons { .. }, Value::Nil) => {
+                    // Too few arguments
+                    let expected = self.count_list(params)?;
+                    let got = self.count_list(args)?;
+                    return Err(self.arg_error(call_expr, expected, got));
+                }
+                // Rest parameter (symbol instead of nil at end)
+                (Value::Symbol { .. }, _) => {
+                    // Bind remaining args to rest parameter
+                    new_env = self.env_extend(new_env, params_cur, args_cur)?;
+                    break;
+                }
+                _ => return Err(self.make_error(ErrorKind::TypeError, params_cur)),
             }
         }
-    }
-    
-    /// Check if a value is falsy (nil)
-    fn is_falsy(&self, val: ArenaIndex) -> Result<bool, EvalError> {
-        Ok(self.lisp.get(val)?.is_nil())
-    }
-    
-    /// Apply a function to arguments
-    fn apply(&mut self, func: ArenaIndex, args: ArenaIndex) -> EvalResult {
-        let func_val = self.lisp.get(func)?;
         
-        match func_val {
-            Value::Builtin(b) => self.apply_builtin(b, args),
-            Value::Lambda { params, body, env } => {
-                // Extend environment with argument bindings
-                let mut new_env = env;
-                let mut params_cur = params;
-                let mut args_cur = args;
-                
-                loop {
-                    let p = self.lisp.get(params_cur)?;
-                    let a = self.lisp.get(args_cur)?;
-                    
-                    match (p, a) {
-                        (Value::Nil, Value::Nil) => break,
-                        (Value::Cons { car: param, cdr: prest }, 
-                         Value::Cons { car: arg, cdr: arest }) => {
-                            new_env = self.env_extend(new_env, param, arg)?;
-                            params_cur = prest;
-                            args_cur = arest;
-                        }
-                        (Value::Nil, _) => return Err(EvalError::WrongArgCount),
-                        (_, Value::Nil) => return Err(EvalError::WrongArgCount),
-                        _ => return Err(EvalError::TypeError),
-                    }
+        Ok(new_env)
+    }
+    
+    /// Count elements in a list
+    fn count_list(&self, mut list: ArenaIndex) -> Result<usize, EvalError> {
+        let mut count = 0;
+        loop {
+            match self.lisp.get(list)? {
+                Value::Nil => return Ok(count),
+                Value::Cons { cdr, .. } => {
+                    count += 1;
+                    list = cdr;
                 }
-                
-                self.eval_in_env(body, new_env)
+                _ => return Ok(count), // Rest parameter
             }
-            _ => Err(EvalError::NotAFunction),
         }
     }
     
-    /// Apply a builtin function
-    fn apply_builtin(&mut self, builtin: Builtin, args: ArenaIndex) -> EvalResult {
+    /// Check if a value is false (ONLY #f is false)
+    fn is_false(&self, val: ArenaIndex) -> Result<bool, EvalError> {
+        Ok(self.lisp.get(val)?.is_false())
+    }
+    
+    /// Force a thunk (lazy evaluation)
+    fn force(&mut self, idx: ArenaIndex) -> EvalResult {
+        let val = self.lisp.get(idx)?;
+        
+        match val {
+            Value::Thunk { expr, env, cached } => {
+                if !cached.is_null() {
+                    // Already evaluated - return cached result
+                    return Ok(cached);
+                }
+                
+                // Evaluate the thunk
+                let result = self.eval_in_env(expr, env)?;
+                
+                // Cache the result (memoization)
+                self.lisp.set(idx, Value::Thunk { expr, env, cached: result })?;
+                
+                Ok(result)
+            }
+            _ => Ok(idx), // Not a thunk, return as-is
+        }
+    }
+    
+    // ========================================================================
+    // Built-in Functions
+    // ========================================================================
+    
+    fn apply_builtin(&mut self, builtin: Builtin, args: ArenaIndex, call_expr: ArenaIndex) -> EvalResult {
         match builtin {
             Builtin::Car => {
                 let arg = self.lisp.car(args)?;
-                Ok(self.lisp.car(arg)?)
+                match self.lisp.get(arg)? {
+                    Value::Cons { car, .. } => Ok(car),
+                    Value::Nil => self.lisp.nil().map_err(Into::into),
+                    _ => Err(self.type_error(call_expr, "pair", self.lisp.get(arg)?.type_name())),
+                }
             }
+            
             Builtin::Cdr => {
                 let arg = self.lisp.car(args)?;
-                Ok(self.lisp.cdr(arg)?)
+                match self.lisp.get(arg)? {
+                    Value::Cons { cdr, .. } => Ok(cdr),
+                    Value::Nil => self.lisp.nil().map_err(Into::into),
+                    _ => Err(self.type_error(call_expr, "pair", self.lisp.get(arg)?.type_name())),
+                }
             }
+            
             Builtin::Cons => {
                 let a = self.lisp.car(args)?;
                 let rest = self.lisp.cdr(args)?;
                 let b = self.lisp.car(rest)?;
                 self.lisp.cons(a, b).map_err(Into::into)
             }
-            Builtin::List => Ok(args), // Already a list!
-            Builtin::Atom => {
-                let arg = self.lisp.car(args)?;
-                let val = self.lisp.get(arg)?;
-                if val.is_atom() {
-                    self.lisp.symbol("t").map_err(Into::into)
-                } else {
-                    self.lisp.nil().map_err(Into::into)
+            
+            Builtin::List => Ok(args),
+            
+            Builtin::SetCar => {
+                let pair = self.lisp.car(args)?;
+                let new_val = self.lisp.car(self.lisp.cdr(args)?)?;
+                
+                match self.lisp.get(pair)? {
+                    Value::Cons { cdr, .. } => {
+                        self.lisp.set(pair, Value::Cons { car: new_val, cdr })?;
+                        Ok(new_val)
+                    }
+                    _ => Err(self.type_error(call_expr, "pair", self.lisp.get(pair)?.type_name())),
                 }
             }
+            
+            Builtin::SetCdr => {
+                let pair = self.lisp.car(args)?;
+                let new_val = self.lisp.car(self.lisp.cdr(args)?)?;
+                
+                match self.lisp.get(pair)? {
+                    Value::Cons { car, .. } => {
+                        self.lisp.set(pair, Value::Cons { car, cdr: new_val })?;
+                        Ok(new_val)
+                    }
+                    _ => Err(self.type_error(call_expr, "pair", self.lisp.get(pair)?.type_name())),
+                }
+            }
+            
+            Builtin::Atom => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.lisp.get(arg)?.is_atom()).map_err(Into::into)
+            }
+            
             Builtin::Eq => {
                 let a = self.lisp.car(args)?;
                 let rest = self.lisp.cdr(args)?;
@@ -580,100 +1049,131 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                 
                 let eq = match (val_a, val_b) {
                     (Value::Nil, Value::Nil) => true,
+                    (Value::True, Value::True) => true,
+                    (Value::False, Value::False) => true,
                     (Value::Number(x), Value::Number(y)) => x == y,
                     (Value::Char(x), Value::Char(y)) => x == y,
-                    (Value::Symbol { .. }, Value::Symbol { .. }) => {
-                        self.lisp.symbol_eq(a, b)?
-                    }
+                    (Value::Symbol { .. }, Value::Symbol { .. }) => self.lisp.symbol_eq(a, b)?,
                     _ => a == b, // Same index
                 };
                 
-                if eq {
-                    self.lisp.symbol("t").map_err(Into::into)
-                } else {
-                    self.lisp.nil().map_err(Into::into)
-                }
+                self.lisp.boolean(eq).map_err(Into::into)
             }
+            
             Builtin::Null => {
                 let arg = self.lisp.car(args)?;
-                if self.lisp.get(arg)?.is_nil() {
-                    self.lisp.symbol("t").map_err(Into::into)
-                } else {
-                    self.lisp.nil().map_err(Into::into)
-                }
+                self.lisp.boolean(self.lisp.get(arg)?.is_nil()).map_err(Into::into)
             }
+            
+            Builtin::Pairp => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.lisp.get(arg)?.is_cons()).map_err(Into::into)
+            }
+            
             Builtin::Numberp => {
                 let arg = self.lisp.car(args)?;
-                if self.lisp.get(arg)?.is_number() {
-                    self.lisp.symbol("t").map_err(Into::into)
-                } else {
-                    self.lisp.nil().map_err(Into::into)
-                }
+                self.lisp.boolean(self.lisp.get(arg)?.is_number()).map_err(Into::into)
             }
-            Builtin::Add => self.numeric_fold(args, 0, |a, b| a.checked_add(b)),
+            
+            Builtin::Booleanp => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.lisp.get(arg)?.is_boolean()).map_err(Into::into)
+            }
+            
+            Builtin::Procedurep => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.lisp.get(arg)?.is_procedure()).map_err(Into::into)
+            }
+            
+            Builtin::Symbolp => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.lisp.get(arg)?.is_symbol()).map_err(Into::into)
+            }
+            
+            Builtin::Force => {
+                let arg = self.lisp.car(args)?;
+                self.force(arg)
+            }
+            
+            Builtin::Promisep => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.lisp.get(arg)?.is_thunk()).map_err(Into::into)
+            }
+            
+            Builtin::Not => {
+                let arg = self.lisp.car(args)?;
+                self.lisp.boolean(self.is_false(arg)?).map_err(Into::into)
+            }
+            
+            Builtin::Add => self.numeric_fold(args, 0, |a, b| a.checked_add(b), call_expr),
+            
             Builtin::Sub => {
-                let first = self.get_number(self.lisp.car(args)?)?;
+                let first = self.get_number(self.lisp.car(args)?, call_expr)?;
                 let rest = self.lisp.cdr(args)?;
                 if self.lisp.get(rest)?.is_nil() {
                     // Unary minus
                     self.lisp.number(-first).map_err(Into::into)
                 } else {
-                    // Subtraction
-                    let result = self.numeric_fold_start(rest, first, |a, b| a.checked_sub(b))?;
-                    Ok(result)
+                    self.numeric_fold_start(rest, first, |a, b| a.checked_sub(b), call_expr)
                 }
             }
-            Builtin::Mul => self.numeric_fold(args, 1, |a, b| a.checked_mul(b)),
+            
+            Builtin::Mul => self.numeric_fold(args, 1, |a, b| a.checked_mul(b), call_expr),
+            
             Builtin::Div => {
-                let first = self.get_number(self.lisp.car(args)?)?;
+                let first = self.get_number(self.lisp.car(args)?, call_expr)?;
                 let rest = self.lisp.cdr(args)?;
                 self.numeric_fold_start(rest, first, |a, b| {
                     if b == 0 { None } else { a.checked_div(b) }
-                })
+                }, call_expr)
             }
+            
             Builtin::Mod => {
-                let a = self.get_number(self.lisp.car(args)?)?;
-                let b = self.get_number(self.lisp.car(self.lisp.cdr(args)?)?)?;
+                let a = self.get_number(self.lisp.car(args)?, call_expr)?;
+                let b = self.get_number(self.lisp.car(self.lisp.cdr(args)?)?, call_expr)?;
                 if b == 0 {
-                    return Err(EvalError::DivisionByZero);
+                    return Err(self.make_error(ErrorKind::DivisionByZero, call_expr));
                 }
                 self.lisp.number(a % b).map_err(Into::into)
             }
-            Builtin::Lt => self.compare(args, |a, b| a < b),
-            Builtin::Gt => self.compare(args, |a, b| a > b),
-            Builtin::Le => self.compare(args, |a, b| a <= b),
-            Builtin::Ge => self.compare(args, |a, b| a >= b),
-            Builtin::NumEq => self.compare(args, |a, b| a == b),
-            Builtin::Print => {
-                // Print is a no-op in no_std eval, handled by REPL
+            
+            Builtin::Lt => self.compare(args, |a, b| a < b, call_expr),
+            Builtin::Gt => self.compare(args, |a, b| a > b, call_expr),
+            Builtin::Le => self.compare(args, |a, b| a <= b, call_expr),
+            Builtin::Ge => self.compare(args, |a, b| a >= b, call_expr),
+            Builtin::NumEq => self.compare(args, |a, b| a == b, call_expr),
+            
+            Builtin::Print | Builtin::Display => {
+                // These are no-ops in no_std eval, handled by REPL
                 Ok(self.lisp.car(args)?)
             }
+            
             Builtin::Newline => {
-                // No-op in no_std
                 self.lisp.nil().map_err(Into::into)
+            }
+            
+            Builtin::Error => {
+                let msg = self.lisp.car(args)?;
+                Err(self.make_error(ErrorKind::UserError, msg))
             }
         }
     }
     
-    /// Get number from value
-    fn get_number(&self, idx: ArenaIndex) -> Result<i64, EvalError> {
+    fn get_number(&self, idx: ArenaIndex, call_expr: ArenaIndex) -> Result<i64, EvalError> {
         match self.lisp.get(idx)? {
             Value::Number(n) => Ok(n),
-            _ => Err(EvalError::TypeError),
+            v => Err(self.type_error(call_expr, "number", v.type_name())),
         }
     }
     
-    /// Fold over numeric arguments
-    fn numeric_fold<F>(&self, args: ArenaIndex, init: i64, f: F) -> EvalResult
-    where
-        F: Fn(i64, i64) -> Option<i64>,
+    fn numeric_fold<F>(&self, args: ArenaIndex, init: i64, f: F, call_expr: ArenaIndex) -> EvalResult
+    where F: Fn(i64, i64) -> Option<i64>
     {
-        self.numeric_fold_start(args, init, f)
+        self.numeric_fold_start(args, init, f, call_expr)
     }
     
-    fn numeric_fold_start<F>(&self, args: ArenaIndex, mut acc: i64, f: F) -> EvalResult
-    where
-        F: Fn(i64, i64) -> Option<i64>,
+    fn numeric_fold_start<F>(&self, args: ArenaIndex, mut acc: i64, f: F, call_expr: ArenaIndex) -> EvalResult
+    where F: Fn(i64, i64) -> Option<i64>
     {
         let mut current = args;
         
@@ -681,29 +1181,26 @@ impl<'a, const N: usize> Evaluator<'a, N> {
             match self.lisp.get(current)? {
                 Value::Nil => return self.lisp.number(acc).map_err(Into::into),
                 Value::Cons { car, cdr } => {
-                    let n = self.get_number(car)?;
-                    acc = f(acc, n).ok_or(EvalError::DivisionByZero)?;
+                    let n = self.get_number(car, call_expr)?;
+                    acc = f(acc, n).ok_or_else(|| self.make_error(ErrorKind::DivisionByZero, call_expr))?;
                     current = cdr;
                 }
-                _ => return Err(EvalError::TypeError),
+                _ => return Err(self.make_error(ErrorKind::TypeError, current)),
             }
         }
     }
     
-    /// Compare two numbers
-    fn compare<F>(&self, args: ArenaIndex, cmp: F) -> EvalResult
-    where
-        F: Fn(i64, i64) -> bool,
+    fn compare<F>(&self, args: ArenaIndex, cmp: F, call_expr: ArenaIndex) -> EvalResult
+    where F: Fn(i64, i64) -> bool
     {
-        let a = self.get_number(self.lisp.car(args)?)?;
-        let b = self.get_number(self.lisp.car(self.lisp.cdr(args)?)?)?;
-        
-        if cmp(a, b) {
-            self.lisp.symbol("t").map_err(Into::into)
-        } else {
-            self.lisp.nil().map_err(Into::into)
-        }
+        let a = self.get_number(self.lisp.car(args)?, call_expr)?;
+        let b = self.get_number(self.lisp.car(self.lisp.cdr(args)?)?, call_expr)?;
+        self.lisp.boolean(cmp(a, b)).map_err(Into::into)
     }
+    
+    // ========================================================================
+    // Convenience
+    // ========================================================================
     
     /// Evaluate a string
     pub fn eval_str(&mut self, input: &str) -> EvalResult {
@@ -720,14 +1217,19 @@ impl<'a, const N: usize> Evaluator<'a, N> {
 mod tests {
     use super::*;
     
-    fn eval_to_num(lisp: &Lisp<1000>, eval: &mut Evaluator<1000>, input: &str) -> i64 {
+    fn eval_to_num<const N: usize>(lisp: &Lisp<N>, eval: &mut Evaluator<N>, input: &str) -> i64 {
         let result = eval.eval_str(input).unwrap();
         lisp.get(result).unwrap().as_number().unwrap()
     }
     
-    fn eval_is_nil(lisp: &Lisp<1000>, eval: &mut Evaluator<1000>, input: &str) -> bool {
+    fn eval_is_true<const N: usize>(lisp: &Lisp<N>, eval: &mut Evaluator<N>, input: &str) -> bool {
         let result = eval.eval_str(input).unwrap();
-        lisp.get(result).unwrap().is_nil()
+        lisp.get(result).unwrap().is_true()
+    }
+    
+    fn eval_is_false<const N: usize>(lisp: &Lisp<N>, eval: &mut Evaluator<N>, input: &str) -> bool {
+        let result = eval.eval_str(input).unwrap();
+        lisp.get(result).unwrap().is_false()
     }
     
     #[test]
@@ -737,6 +1239,29 @@ mod tests {
         
         assert_eq!(eval_to_num(&lisp, &mut eval, "42"), 42);
         assert_eq!(eval_to_num(&lisp, &mut eval, "-10"), -10);
+    }
+    
+    #[test]
+    fn test_eval_booleans() {
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        assert!(eval_is_true(&lisp, &mut eval, "#t"));
+        assert!(eval_is_false(&lisp, &mut eval, "#f"));
+        assert!(eval_is_true(&lisp, &mut eval, "true"));
+        assert!(eval_is_false(&lisp, &mut eval, "false"));
+    }
+    
+    #[test]
+    fn test_nil_is_truthy() {
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // nil/'() is NOT false - only #f is false
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(if nil 1 2)"), 1);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(if '() 1 2)"), 1);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(if 0 1 2)"), 1);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(if #f 1 2)"), 2);
     }
     
     #[test]
@@ -765,8 +1290,8 @@ mod tests {
         let lisp: Lisp<1000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(if t 1 2)"), 1);
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(if nil 1 2)"), 2);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(if #t 1 2)"), 1);
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(if #f 1 2)"), 2);
         assert_eq!(eval_to_num(&lisp, &mut eval, "(if (< 1 2) 10 20)"), 10);
     }
     
@@ -805,8 +1330,27 @@ mod tests {
     }
     
     #[test]
-    fn test_eval_recursion() {
+    fn test_eval_let_star() {
         let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // let* allows sequential binding
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(let* ((x 10) (y (+ x 5))) (+ x y))"), 25);
+    }
+    
+    #[test]
+    fn test_tco_recursion() {
+        let lisp: Lisp<5000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // This would stack overflow without TCO
+        eval.eval_str("(define (sum-to n acc) (if (= n 0) acc (sum-to (- n 1) (+ acc n))))").unwrap();
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(sum-to 100 0)"), 5050);
+    }
+    
+    #[test]
+    fn test_eval_recursion() {
+        let lisp: Lisp<2000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
         eval.eval_str("(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))").unwrap();
@@ -814,33 +1358,97 @@ mod tests {
     }
     
     #[test]
-    fn test_eval_cons_car_cdr() {
+    fn test_set_car_cdr() {
         let lisp: Lisp<1000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(car '(1 2 3))"), 1);
-        assert_eq!(eval_to_num(&lisp, &mut eval, "(car (cdr '(1 2 3)))"), 2);
-    }
-    
-    fn eval_is_truthy(lisp: &Lisp<1000>, eval: &mut Evaluator<1000>, input: &str) -> bool {
-        let result = eval.eval_str(input).unwrap();
-        !lisp.get(result).unwrap().is_nil()
+        eval.eval_str("(define x (cons 1 2))").unwrap();
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(car x)"), 1);
+        
+        eval.eval_str("(set-car! x 100)").unwrap();
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(car x)"), 100);
+        
+        eval.eval_str("(set-cdr! x 200)").unwrap();
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(cdr x)"), 200);
     }
     
     #[test]
-    fn test_eval_list_functions() {
+    fn test_delay_force() {
         let lisp: Lisp<1000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
-        // (null '()) should return t (truthy)
-        assert!(eval_is_truthy(&lisp, &mut eval, "(null '())"));
-        assert!(eval_is_truthy(&lisp, &mut eval, "(null nil)"));
-        // (null '(1)) should return nil (falsy)
-        assert!(!eval_is_truthy(&lisp, &mut eval, "(null '(1))"));
+        // Create a thunk
+        eval.eval_str("(define lazy-val (delay (+ 1 2)))").unwrap();
+        
+        // Check it's a promise
+        assert!(eval_is_true(&lisp, &mut eval, "(promise? lazy-val)"));
+        
+        // Force it
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-val)"), 3);
+        
+        // Force again - should return cached value
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-val)"), 3);
     }
     
     #[test]
-    fn test_eval_cond() {
+    fn test_lazy_memoization() {
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        // Use mutation to verify memoization
+        eval.eval_str("(define counter 0)").unwrap();
+        eval.eval_str("(define lazy-inc (delay (begin (set! counter (+ counter 1)) counter)))").unwrap();
+        
+        // First force - increments counter
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-inc)"), 1);
+        
+        // Second force - should return cached value, not increment again
+        assert_eq!(eval_to_num(&lisp, &mut eval, "(force lazy-inc)"), 1);
+        
+        // Counter should still be 1
+        assert_eq!(eval_to_num(&lisp, &mut eval, "counter"), 1);
+    }
+    
+    #[test]
+    fn test_predicates() {
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        assert!(eval_is_true(&lisp, &mut eval, "(null? '())"));
+        assert!(eval_is_true(&lisp, &mut eval, "(null? nil)"));
+        assert!(eval_is_false(&lisp, &mut eval, "(null? '(1))"));
+        
+        assert!(eval_is_true(&lisp, &mut eval, "(pair? '(1 . 2))"));
+        assert!(eval_is_false(&lisp, &mut eval, "(pair? 42)"));
+        
+        assert!(eval_is_true(&lisp, &mut eval, "(number? 42)"));
+        assert!(eval_is_false(&lisp, &mut eval, "(number? 'x)"));
+        
+        assert!(eval_is_true(&lisp, &mut eval, "(boolean? #t)"));
+        assert!(eval_is_true(&lisp, &mut eval, "(boolean? #f)"));
+        assert!(eval_is_false(&lisp, &mut eval, "(boolean? 1)"));
+        
+        assert!(eval_is_true(&lisp, &mut eval, "(symbol? 'x)"));
+        assert!(eval_is_false(&lisp, &mut eval, "(symbol? 42)"));
+        
+        assert!(eval_is_true(&lisp, &mut eval, "(procedure? +)"));
+        assert!(eval_is_true(&lisp, &mut eval, "(procedure? (lambda (x) x))"));
+        assert!(eval_is_false(&lisp, &mut eval, "(procedure? 42)"));
+    }
+    
+    #[test]
+    fn test_not() {
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        assert!(eval_is_true(&lisp, &mut eval, "(not #f)"));
+        assert!(eval_is_false(&lisp, &mut eval, "(not #t)"));
+        assert!(eval_is_false(&lisp, &mut eval, "(not nil)")); // nil is truthy!
+        assert!(eval_is_false(&lisp, &mut eval, "(not 0)"));   // 0 is truthy!
+    }
+    
+    #[test]
+    fn test_cond() {
         let lisp: Lisp<1000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
@@ -850,17 +1458,26 @@ mod tests {
     }
     
     #[test]
+    fn test_and_or() {
+        let lisp: Lisp<1000> = Lisp::new();
+        let mut eval = Evaluator::new(&lisp).unwrap();
+        
+        assert!(eval_is_true(&lisp, &mut eval, "(and #t #t)"));
+        assert!(eval_is_false(&lisp, &mut eval, "(and #t #f)"));
+        assert!(eval_is_true(&lisp, &mut eval, "(and)"));  // Empty and is true
+        
+        assert!(eval_is_true(&lisp, &mut eval, "(or #f #t)"));
+        assert!(eval_is_false(&lisp, &mut eval, "(or #f #f)"));
+        assert!(eval_is_false(&lisp, &mut eval, "(or)"));  // Empty or is false
+    }
+    
+    #[test]
     fn test_gc_during_eval() {
         let lisp: Lisp<1000> = Lisp::new();
         let mut eval = Evaluator::new(&lisp).unwrap();
         
-        // Define something
         eval.eval_str("(define x 42)").unwrap();
-        
-        // Run GC
         let _stats = eval.gc();
-        
-        // Value should still be accessible
         assert_eq!(eval_to_num(&lisp, &mut eval, "x"), 42);
     }
 }
