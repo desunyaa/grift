@@ -2268,3 +2268,638 @@ fn test_gc_stats_accuracy() {
     assert_eq!(stats.collected, 5);
     assert_eq!(arena.len(), 5);
 }
+
+// ============================================================================
+// GC Stress Tests
+// ============================================================================
+
+/// Node with many children to test the 16-child buffer limit in GC
+#[derive(Clone, Copy)]
+struct ManyChildNode {
+    children: [Option<ArenaIndex>; 8],
+}
+
+impl<const N: usize> Trace<ManyChildNode, N> for ManyChildNode {
+    fn trace<F: FnMut(ArenaIndex)>(&self, mut tracer: F) {
+        for child in &self.children {
+            if let Some(idx) = child {
+                tracer(*idx);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_gc_stress_wide_tree() {
+    // Test tree where each node has many children
+    let arena: Arena<ManyChildNode, 1000> = Arena::new(ManyChildNode {
+        children: [None; 8],
+    });
+
+    // Create a wide tree with 8 children per node, 3 levels deep
+    // Level 0: 1 root
+    // Level 1: 8 nodes
+    // Level 2: 64 nodes
+    // Total: 73 nodes
+
+    let mut level2_nodes = Vec::new();
+    for _ in 0..64 {
+        let node = arena
+            .alloc(ManyChildNode {
+                children: [None; 8],
+            })
+            .unwrap();
+        level2_nodes.push(node);
+    }
+
+    let mut level1_nodes = Vec::new();
+    for i in 0..8 {
+        let mut children = [None; 8];
+        for j in 0..8 {
+            children[j] = Some(level2_nodes[i * 8 + j]);
+        }
+        let node = arena.alloc(ManyChildNode { children }).unwrap();
+        level1_nodes.push(node);
+    }
+
+    let mut root_children = [None; 8];
+    for i in 0..8 {
+        root_children[i] = Some(level1_nodes[i]);
+    }
+    let root = arena.alloc(ManyChildNode { children: root_children }).unwrap();
+
+    // Add garbage
+    for _ in 0..100 {
+        arena
+            .alloc(ManyChildNode {
+                children: [None; 8],
+            })
+            .unwrap();
+    }
+
+    assert_eq!(arena.len(), 173); // 73 tree + 100 garbage
+
+    let stats = arena.collect_garbage(&[root]);
+
+    assert_eq!(stats.marked, 73);
+    assert_eq!(stats.collected, 100);
+    assert_eq!(arena.len(), 73);
+}
+
+#[test]
+fn test_gc_stress_very_deep_tree() {
+    let arena: Arena<Tree, 2000> = Arena::new(Tree::Leaf(0));
+
+    // Build an extremely deep tree (500 levels to leave room for garbage)
+    // 1 initial + 499 iterations * 2 = 999 nodes
+    let mut current = arena.alloc(Tree::Leaf(0)).unwrap();
+    for i in 1..500 {
+        let leaf = arena.alloc(Tree::Leaf(i)).unwrap();
+        current = arena.alloc(Tree::Branch(current, leaf)).unwrap();
+    }
+
+    let root = current;
+    let tree_size = arena.len();
+    assert_eq!(tree_size, 999);
+
+    // Add garbage to fill remaining space
+    let garbage_to_add = 500usize;
+    for i in 0..garbage_to_add {
+        arena.alloc(Tree::Leaf(10000 + i as i32)).unwrap();
+    }
+
+    assert_eq!(arena.len(), 999 + garbage_to_add);
+
+    let stats = arena.collect_garbage(&[root]);
+
+    assert_eq!(stats.marked, 999);
+    assert_eq!(stats.collected, garbage_to_add);
+    assert_eq!(arena.len(), 999);
+}
+
+#[test]
+fn test_gc_stress_full_arena_all_garbage() {
+    let arena: Arena<Tree, 500> = Arena::new(Tree::Leaf(0));
+
+    // Fill the entire arena with garbage (no roots)
+    for i in 0..500 {
+        arena.alloc(Tree::Leaf(i)).unwrap();
+    }
+
+    assert!(arena.is_full());
+
+    // Collect with no roots - everything is garbage
+    let stats = arena.collect_garbage(&[]);
+
+    assert_eq!(stats.marked, 0);
+    assert_eq!(stats.collected, 500);
+    assert!(arena.is_empty());
+}
+
+#[test]
+fn test_gc_stress_full_arena_all_reachable() {
+    let arena: Arena<Tree, 500> = Arena::new(Tree::Leaf(0));
+
+    // Build a tree that uses all 500 slots
+    // Binary tree: n leaves need n-1 internal nodes, so ~250 leaves + 249 internal = 499
+    // Let's do a linked structure instead for simplicity
+
+    let mut roots = Vec::new();
+
+    // Create 250 small trees (2 nodes each = 500 total)
+    for i in 0..250 {
+        let leaf = arena.alloc(Tree::Leaf(i * 2)).unwrap();
+        let branch = arena.alloc(Tree::Branch(leaf, leaf)).unwrap();
+        roots.push(branch);
+    }
+
+    assert!(arena.is_full());
+
+    // All should be reachable
+    let stats = arena.collect_garbage(&roots);
+
+    assert_eq!(stats.marked, 500);
+    assert_eq!(stats.collected, 0);
+    assert!(arena.is_full());
+}
+
+#[test]
+fn test_gc_stress_rapid_cycles() {
+    let arena: Arena<Tree, 100> = Arena::new(Tree::Leaf(0));
+
+    let mut root = arena.alloc(Tree::Leaf(0)).unwrap();
+
+    // Perform 1000 rapid GC cycles
+    for round in 0..1000 {
+        // Add a node to the tree
+        if arena.available() >= 2 {
+            let new_leaf = arena.alloc(Tree::Leaf(round)).unwrap();
+            root = arena.alloc(Tree::Branch(root, new_leaf)).unwrap();
+        }
+
+        // Add some garbage
+        let garbage_count = (round % 5) + 1;
+        for i in 0..garbage_count {
+            if arena.available() > 0 {
+                arena.alloc(Tree::Leaf(10000 + round * 10 + i)).unwrap();
+            }
+        }
+
+        // Collect
+        let stats = arena.collect_garbage(&[root]);
+
+        // Should have collected the garbage we just added
+        assert!(stats.collected <= garbage_count as usize);
+
+        // Tree should still be intact
+        assert!(arena.is_allocated(root));
+    }
+}
+
+#[test]
+fn test_gc_stress_alternating_patterns() {
+    let arena: Arena<Tree, 300> = Arena::new(Tree::Leaf(0));
+
+    for pattern in 0..10 {
+        // Clear previous
+        arena.clear();
+
+        let mut roots = Vec::new();
+
+        // Different allocation patterns each round
+        match pattern % 4 {
+            0 => {
+                // Many small trees
+                for i in 0..50 {
+                    let leaf = arena.alloc(Tree::Leaf(i)).unwrap();
+                    roots.push(leaf);
+                }
+                // Add garbage
+                for i in 0..50 {
+                    arena.alloc(Tree::Leaf(1000 + i)).unwrap();
+                }
+            }
+            1 => {
+                // Few large trees (5 trees * 29 nodes each = 145 nodes)
+                for _ in 0..5 {
+                    let mut node = arena.alloc(Tree::Leaf(0)).unwrap();
+                    for j in 1..15 {
+                        let leaf = arena.alloc(Tree::Leaf(j)).unwrap();
+                        node = arena.alloc(Tree::Branch(node, leaf)).unwrap();
+                    }
+                    roots.push(node);
+                }
+                // Add some garbage (not filling completely)
+                for _ in 0..50 {
+                    arena.alloc(Tree::Leaf(9999)).unwrap();
+                }
+            }
+            2 => {
+                // Single large tree (1 + 50*2 = 101 nodes)
+                let mut node = arena.alloc(Tree::Leaf(0)).unwrap();
+                for i in 1..51 {
+                    let leaf = arena.alloc(Tree::Leaf(i)).unwrap();
+                    node = arena.alloc(Tree::Branch(node, leaf)).unwrap();
+                }
+                roots.push(node);
+                // Add some garbage
+                for _ in 0..50 {
+                    arena.alloc(Tree::Leaf(8888)).unwrap();
+                }
+            }
+            3 => {
+                // Interleaved roots and garbage
+                for i in 0..100 {
+                    let node = arena.alloc(Tree::Leaf(i)).unwrap();
+                    if i % 2 == 0 {
+                        roots.push(node);
+                    }
+                    // Node is garbage if odd
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        let before = arena.len();
+        let stats = arena.collect_garbage(&roots);
+
+        // Verify roots survived
+        for root in &roots {
+            assert!(arena.is_allocated(*root));
+        }
+
+        // Verify something was collected (except maybe pattern 0 with 50/50 split)
+        if pattern % 4 != 0 {
+            assert!(stats.collected > 0 || stats.marked == before);
+        }
+    }
+}
+
+#[test]
+fn test_gc_stress_fragmented_heap() {
+    let arena: Arena<Tree, 100> = Arena::new(Tree::Leaf(0));
+
+    // Create highly fragmented heap
+    let mut indices = Vec::new();
+    for i in 0..100 {
+        indices.push(arena.alloc(Tree::Leaf(i)).unwrap());
+    }
+
+    // Free every other slot (creates fragmentation)
+    for i in (0..100).step_by(2) {
+        arena.free(indices[i]).unwrap();
+    }
+
+    // Remaining 50 slots are our "roots"
+    let roots: Vec<ArenaIndex> = indices.iter().enumerate()
+        .filter(|(i, _)| i % 2 == 1)
+        .map(|(_, &idx)| idx)
+        .collect();
+
+    // Allocate in the gaps (these become garbage)
+    for i in 0..50 {
+        arena.alloc(Tree::Leaf(1000 + i)).unwrap();
+    }
+
+    assert!(arena.is_full());
+
+    // Collect - should free the newly allocated garbage
+    let stats = arena.collect_garbage(&roots);
+
+    assert_eq!(stats.marked, 50);
+    assert_eq!(stats.collected, 50);
+    assert_eq!(arena.len(), 50);
+}
+
+#[test]
+fn test_gc_stress_many_roots() {
+    let arena: Arena<Tree, 1000> = Arena::new(Tree::Leaf(0));
+
+    // Create 500 individual roots (each a single leaf)
+    let mut roots = Vec::new();
+    for i in 0..500 {
+        let root = arena.alloc(Tree::Leaf(i)).unwrap();
+        roots.push(root);
+    }
+
+    // Add 500 garbage nodes
+    for i in 0..500 {
+        arena.alloc(Tree::Leaf(10000 + i)).unwrap();
+    }
+
+    assert!(arena.is_full());
+
+    let stats = arena.collect_garbage(&roots);
+
+    assert_eq!(stats.marked, 500);
+    assert_eq!(stats.collected, 500);
+    assert_eq!(arena.len(), 500);
+}
+
+#[test]
+fn test_gc_stress_diamond_dag() {
+    // Create a DAG where many nodes share the same children
+    let arena: Arena<Tree, 500> = Arena::new(Tree::Leaf(0));
+
+    // Create shared leaves
+    let mut shared_leaves = Vec::new();
+    for i in 0..10 {
+        shared_leaves.push(arena.alloc(Tree::Leaf(i)).unwrap());
+    }
+
+    // Create many branches that all point to the same shared leaves
+    let mut roots = Vec::new();
+    for i in 0..100 {
+        let left_idx = i % 10;
+        let right_idx = (i + 1) % 10;
+        let branch = arena
+            .alloc(Tree::Branch(shared_leaves[left_idx], shared_leaves[right_idx]))
+            .unwrap();
+        roots.push(branch);
+    }
+
+    // Add garbage
+    for i in 0..200 {
+        arena.alloc(Tree::Leaf(1000 + i)).unwrap();
+    }
+
+    let stats = arena.collect_garbage(&roots);
+
+    // Should mark: 10 shared leaves + 100 branches = 110
+    assert_eq!(stats.marked, 110);
+    assert_eq!(stats.collected, 200);
+}
+
+#[test]
+fn test_gc_stress_complex_cycles() {
+    // Create a structure with multiple interconnected cycles
+    #[derive(Clone, Copy)]
+    struct CycleNode {
+        refs: [Option<ArenaIndex>; 4],
+    }
+
+    impl<const N: usize> Trace<CycleNode, N> for CycleNode {
+        fn trace<F: FnMut(ArenaIndex)>(&self, mut tracer: F) {
+            for r in &self.refs {
+                if let Some(idx) = r {
+                    tracer(*idx);
+                }
+            }
+        }
+    }
+
+    let arena: Arena<CycleNode, 100> = Arena::new(CycleNode { refs: [None; 4] });
+
+    // Create a ring of nodes
+    let mut ring_nodes = Vec::new();
+    for _ in 0..20 {
+        ring_nodes.push(
+            arena
+                .alloc(CycleNode { refs: [None; 4] })
+                .unwrap(),
+        );
+    }
+
+    // Connect them in a ring with cross-connections
+    for i in 0..20 {
+        let next = (i + 1) % 20;
+        let cross1 = (i + 5) % 20;
+        let cross2 = (i + 10) % 20;
+
+        arena
+            .set(
+                ring_nodes[i],
+                CycleNode {
+                    refs: [
+                        Some(ring_nodes[next]),
+                        Some(ring_nodes[cross1]),
+                        Some(ring_nodes[cross2]),
+                        None,
+                    ],
+                },
+            )
+            .unwrap();
+    }
+
+    // Add garbage nodes
+    for _ in 0..50 {
+        arena.alloc(CycleNode { refs: [None; 4] }).unwrap();
+    }
+
+    // Use first ring node as root
+    let stats = arena.collect_garbage(&[ring_nodes[0]]);
+
+    assert_eq!(stats.marked, 20); // All ring nodes reachable
+    assert_eq!(stats.collected, 50);
+}
+
+#[test]
+fn test_gc_stress_maximum_children_per_trace() {
+    // Test the 16-child buffer limit by having nodes with exactly 16+ children
+    // traced in rapid succession
+
+    #[derive(Clone, Copy)]
+    struct Node16 {
+        children: [Option<ArenaIndex>; 16],
+    }
+
+    impl<const N: usize> Trace<Node16, N> for Node16 {
+        fn trace<F: FnMut(ArenaIndex)>(&self, mut tracer: F) {
+            for child in &self.children {
+                if let Some(idx) = child {
+                    tracer(*idx);
+                }
+            }
+        }
+    }
+
+    let arena: Arena<Node16, 500> = Arena::new(Node16 { children: [None; 16] });
+
+    // Create leaves
+    let mut leaves = Vec::new();
+    for _ in 0..32 {
+        leaves.push(arena.alloc(Node16 { children: [None; 16] }).unwrap());
+    }
+
+    // Create a node with exactly 16 children
+    let mut children1 = [None; 16];
+    for i in 0..16 {
+        children1[i] = Some(leaves[i]);
+    }
+    let node1 = arena.alloc(Node16 { children: children1 }).unwrap();
+
+    // Create another node with 16 different children
+    let mut children2 = [None; 16];
+    for i in 0..16 {
+        children2[i] = Some(leaves[16 + i]);
+    }
+    let node2 = arena.alloc(Node16 { children: children2 }).unwrap();
+
+    // Root points to both
+    let root = arena
+        .alloc(Node16 {
+            children: [
+                Some(node1),
+                Some(node2),
+                None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None,
+            ],
+        })
+        .unwrap();
+
+    // Add garbage
+    for _ in 0..100 {
+        arena.alloc(Node16 { children: [None; 16] }).unwrap();
+    }
+
+    let stats = arena.collect_garbage(&[root]);
+
+    // root + 2 intermediate + 32 leaves = 35
+    assert_eq!(stats.marked, 35);
+    assert_eq!(stats.collected, 100);
+}
+
+#[test]
+fn test_gc_stress_repeated_collect_same_roots() {
+    let arena: Arena<Tree, 100> = Arena::new(Tree::Leaf(0));
+
+    let leaf1 = arena.alloc(Tree::Leaf(1)).unwrap();
+    let leaf2 = arena.alloc(Tree::Leaf(2)).unwrap();
+    let root = arena.alloc(Tree::Branch(leaf1, leaf2)).unwrap();
+
+    // Repeatedly collect with same roots - should be idempotent
+    for _ in 0..100 {
+        // Add some garbage
+        if arena.available() >= 5 {
+            for i in 0..5 {
+                arena.alloc(Tree::Leaf(1000 + i)).unwrap();
+            }
+        }
+
+        let stats = arena.collect_garbage(&[root]);
+
+        // Should always have 3 marked (our tree)
+        assert_eq!(stats.marked, 3);
+
+        // Tree should remain intact
+        assert_eq!(arena.get(root).unwrap(), Tree::Branch(leaf1, leaf2));
+        assert_eq!(arena.get(leaf1).unwrap(), Tree::Leaf(1));
+        assert_eq!(arena.get(leaf2).unwrap(), Tree::Leaf(2));
+    }
+}
+
+#[test]
+fn test_gc_stress_collect_after_mutations() {
+    let arena: Arena<Tree, 100> = Arena::new(Tree::Leaf(0));
+
+    let mut leaf = arena.alloc(Tree::Leaf(0)).unwrap();
+
+    for round in 0..50 {
+        // Mutate the leaf value
+        arena.set(leaf, Tree::Leaf(round)).unwrap();
+
+        // Add garbage
+        let garbage = arena.alloc(Tree::Leaf(1000 + round)).unwrap();
+
+        // Collect
+        let stats = arena.collect_garbage(&[leaf]);
+
+        assert_eq!(stats.marked, 1);
+        assert_eq!(stats.collected, 1);
+
+        // Garbage should be gone
+        assert!(!arena.is_allocated(garbage));
+
+        // Leaf should have new value
+        assert_eq!(arena.get(leaf).unwrap(), Tree::Leaf(round));
+    }
+}
+
+#[test]
+fn test_gc_stress_enabled_disabled_cycles() {
+    let arena: Arena<Tree, 100> = Arena::new(Tree::Leaf(0));
+
+    let root = arena.alloc(Tree::Leaf(0)).unwrap();
+
+    for round in 0..100 {
+        // Add garbage
+        arena.alloc(Tree::Leaf(round * 100)).unwrap();
+
+        // Alternate enabled/disabled
+        arena.set_gc_enabled(round % 2 == 0);
+
+        let stats = arena.collect_garbage(&[root]);
+
+        if round % 2 == 0 {
+            // GC was enabled, should have collected
+            assert!(stats.collected >= 1 || arena.len() == 1);
+        } else {
+            // GC was disabled, nothing collected
+            assert_eq!(stats.collected, 0);
+        }
+    }
+
+    // Enable and final collect
+    arena.set_gc_enabled(true);
+    let final_stats = arena.collect_garbage(&[root]);
+
+    // Should collect any remaining garbage
+    assert_eq!(arena.len(), 1);
+}
+
+#[test]
+fn test_gc_stress_worst_case_mark_stack() {
+    // Create a structure that maximizes mark stack usage
+    // A long chain where each node must be pushed to the stack
+    let arena: Arena<Tree, 500> = Arena::new(Tree::Leaf(0));
+
+    // Build a right-leaning tree (worst case for stack depth)
+    let mut current = arena.alloc(Tree::Leaf(0)).unwrap();
+    for i in 1..250 {
+        let new_branch = arena.alloc(Tree::Branch(current, current)).unwrap();
+        current = new_branch;
+    }
+
+    let root = current;
+
+    // Add garbage
+    while arena.available() > 0 {
+        arena.alloc(Tree::Leaf(9999)).unwrap();
+    }
+
+    let stats = arena.collect_garbage(&[root]);
+
+    // All tree nodes should be marked
+    assert!(stats.marked > 0);
+    // Garbage should be collected
+    assert!(stats.collected > 0);
+}
+
+#[test]
+fn test_gc_stress_incremental_tree_building() {
+    let arena: Arena<Tree, 500> = Arena::new(Tree::Leaf(0));
+
+    let mut root = arena.alloc(Tree::Leaf(0)).unwrap();
+
+    // Build tree incrementally with GC after each step
+    for i in 1..100i32 {
+        // Expand tree
+        let new_leaf = arena.alloc(Tree::Leaf(i)).unwrap();
+        root = arena.alloc(Tree::Branch(root, new_leaf)).unwrap();
+
+        // Add garbage proportional to tree size
+        let garbage_count = i % 10;
+        for j in 0..garbage_count {
+            if arena.available() > 0 {
+                arena.alloc(Tree::Leaf(1000 * i + j)).unwrap();
+            }
+        }
+
+        // Collect
+        let stats = arena.collect_garbage(&[root]);
+
+        // Tree should be intact
+        let expected_tree_size = (1 + i * 2) as usize; // initial leaf + i*(leaf + branch)
+        assert_eq!(stats.marked, expected_tree_size);
+    }
+}

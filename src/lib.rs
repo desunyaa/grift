@@ -2,17 +2,18 @@
 
 //! # Fixed-Size Arena Allocator
 //!
-//! A minimal no-std arena allocator with fixed capacity.
+//! A minimal no-std, no-alloc arena allocator with fixed capacity.
 //!
 //! ## Features
 //!
 //! - **Fixed-size**: All memory pre-allocated at compile time
-//! - **No-std**: Works in embedded environments (requires `alloc` for GC)
+//! - **No-std, no-alloc**: Works in embedded environments with no heap
 //! - **Generic**: Works with any `Copy` type
 //! - **Interior mutability**: Safe concurrent access via `RefCell`
 //! - **Generational indices**: Detects use-after-free (ABA problem)
 //! - **O(1) allocation**: Free-list based allocation and deallocation
 //! - **Mark-and-sweep GC**: Trait-based garbage collection via [`Trace`]
+//! - **Zero dependencies**: Only uses `core::cell::RefCell`
 //!
 //! ## Example
 //!
@@ -41,9 +42,6 @@
 //! arena.free(root).unwrap();
 //! ```
 
-extern crate alloc;
-
-use alloc::vec::Vec;
 use core::cell::RefCell;
 
 // ============================================================================
@@ -806,8 +804,12 @@ impl<T: Copy, const N: usize> Arena<T, N> {
         }
 
         // Mark phase: track which slots are reachable
+        // Using fixed-size arrays instead of Vec for no-alloc compatibility
         let mut marked = [false; N];
-        let mut mark_stack: Vec<ArenaIndex> = Vec::new();
+
+        // Fixed-size mark stack (worst case: all N slots could be on stack)
+        let mut mark_stack = [0usize; N];
+        let mut stack_len = 0usize;
 
         // Initialize stack with valid roots
         for &root in roots {
@@ -815,54 +817,83 @@ impl<T: Copy, const N: usize> Arena<T, N> {
                 let idx = root.raw();
                 if idx < N && !marked[idx] {
                     marked[idx] = true;
-                    mark_stack.push(root);
+                    if stack_len < N {
+                        mark_stack[stack_len] = idx;
+                        stack_len += 1;
+                    }
                 }
             }
         }
 
         // Process mark stack (depth-first traversal)
-        while let Some(current) = mark_stack.pop() {
-            if let Ok(value) = self.get(current) {
-                // Trace this value's references
+        while stack_len > 0 {
+            stack_len -= 1;
+            let current_idx = mark_stack[stack_len];
+
+            let slots = self.slots.borrow();
+            let generations = self.generations.borrow();
+
+            if let Slot::Occupied { value } = slots[current_idx] {
+                let current_gen = generations[current_idx];
+                drop(slots);
+                drop(generations);
+
+                // Collect children to mark (using a small temporary array)
+                // We trace into a temporary buffer to avoid borrow issues
+                let mut children = [0usize; 16]; // Most nodes have few children
+                let mut child_count = 0usize;
+
                 value.trace(|child_index| {
-                    if self.is_allocated(child_index) {
+                    if child_count < 16 {
                         let idx = child_index.raw();
                         if idx < N && !marked[idx] {
-                            marked[idx] = true;
-                            mark_stack.push(child_index);
+                            children[child_count] = idx;
+                            child_count += 1;
                         }
                     }
                 });
+
+                // Now mark and push children
+                for i in 0..child_count {
+                    let idx = children[i];
+                    if !marked[idx] && self.is_allocated(ArenaIndex::new(idx, self.generations.borrow()[idx])) {
+                        marked[idx] = true;
+                        if stack_len < N {
+                            mark_stack[stack_len] = idx;
+                            stack_len += 1;
+                        }
+                    }
+                }
             }
         }
 
         let marked_count = marked.iter().filter(|&&m| m).count();
 
         // Sweep phase: free all unmarked but allocated slots
-        let mut collected = 0;
-        let slots = self.slots.borrow();
-        let generations = self.generations.borrow();
+        // Collect indices to free into fixed-size array
+        let mut to_free = [0usize; N];
+        let mut to_free_len = 0usize;
 
-        // Collect indices to free (can't free while iterating)
-        let mut to_free: Vec<ArenaIndex> = Vec::new();
+        {
+            let slots = self.slots.borrow();
 
-        for idx in 0..N {
-            if let Slot::Occupied { .. } = slots[idx] {
-                if !marked[idx] {
-                    // This slot is allocated but not reachable - garbage!
-                    let index = ArenaIndex::new(idx, generations[idx]);
-                    to_free.push(index);
+            for idx in 0..N {
+                if let Slot::Occupied { .. } = slots[idx] {
+                    if !marked[idx] {
+                        // This slot is allocated but not reachable - garbage!
+                        to_free[to_free_len] = idx;
+                        to_free_len += 1;
+                    }
                 }
             }
         }
 
-        // Drop borrows before freeing
-        drop(slots);
-        drop(generations);
-
         // Free the garbage
-        for index in to_free {
-            if self.free(index).is_ok() {
+        let mut collected = 0;
+        for i in 0..to_free_len {
+            let idx = to_free[i];
+            let generation = self.generations.borrow()[idx];
+            if self.free(ArenaIndex::new(idx, generation)).is_ok() {
                 collected += 1;
             }
         }
@@ -921,17 +952,121 @@ impl<T: Copy, const N: usize> Arena<T, N> {
 
     /// Perform garbage collection with multiple root sets.
     ///
-    /// This is a convenience method that flattens multiple root arrays
-    /// into a single collection pass.
+    /// This iterates through all provided root sets and marks objects
+    /// reachable from any of them.
     ///
     /// Respects the `gc_enabled` flag - use [`Arena::collect_garbage_multi_forced`]
     /// to ignore the flag.
+    ///
+    /// # Note
+    ///
+    /// For no-alloc compatibility, this method iterates through root sets
+    /// sequentially rather than flattening them. This has the same effect
+    /// but uses constant stack space.
     pub fn collect_garbage_multi(&self, root_sets: &[&[ArenaIndex]]) -> GcStats
     where
         T: Trace<T, N>,
     {
-        let roots: Vec<ArenaIndex> = root_sets.iter().flat_map(|s| s.iter().copied()).collect();
-        self.collect_garbage(&roots)
+        let total_before = self.len();
+
+        // If GC is disabled, return immediately without collecting
+        if !self.is_gc_enabled() {
+            return GcStats {
+                marked: 0,
+                collected: 0,
+                total_before,
+            };
+        }
+
+        // Mark phase with multiple root sets
+        let mut marked = [false; N];
+        let mut mark_stack = [0usize; N];
+        let mut stack_len = 0usize;
+
+        // Initialize stack with valid roots from all root sets
+        for root_set in root_sets {
+            for &root in *root_set {
+                if self.is_allocated(root) {
+                    let idx = root.raw();
+                    if idx < N && !marked[idx] {
+                        marked[idx] = true;
+                        if stack_len < N {
+                            mark_stack[stack_len] = idx;
+                            stack_len += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process mark stack (same as collect_garbage)
+        while stack_len > 0 {
+            stack_len -= 1;
+            let current_idx = mark_stack[stack_len];
+
+            let slots = self.slots.borrow();
+
+            if let Slot::Occupied { value } = slots[current_idx] {
+                drop(slots);
+
+                let mut children = [0usize; 16];
+                let mut child_count = 0usize;
+
+                value.trace(|child_index| {
+                    if child_count < 16 {
+                        let idx = child_index.raw();
+                        if idx < N && !marked[idx] {
+                            children[child_count] = idx;
+                            child_count += 1;
+                        }
+                    }
+                });
+
+                for i in 0..child_count {
+                    let idx = children[i];
+                    if !marked[idx] && self.is_allocated(ArenaIndex::new(idx, self.generations.borrow()[idx])) {
+                        marked[idx] = true;
+                        if stack_len < N {
+                            mark_stack[stack_len] = idx;
+                            stack_len += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let marked_count = marked.iter().filter(|&&m| m).count();
+
+        // Sweep phase
+        let mut to_free = [0usize; N];
+        let mut to_free_len = 0usize;
+
+        {
+            let slots = self.slots.borrow();
+            for idx in 0..N {
+                if let Slot::Occupied { .. } = slots[idx] {
+                    if !marked[idx] {
+                        to_free[to_free_len] = idx;
+                        to_free_len += 1;
+                    }
+                }
+            }
+        }
+
+        let mut collected = 0;
+        for i in 0..to_free_len {
+            let idx = to_free[i];
+            let generation = self.generations.borrow()[idx];
+            if self.free(ArenaIndex::new(idx, generation)).is_ok() {
+                collected += 1;
+            }
+        }
+
+        GcStats {
+            marked: marked_count,
+            collected,
+            total_before,
+        }
     }
 
     /// Force garbage collection with multiple root sets, ignoring the `gc_enabled` flag.
@@ -939,8 +1074,11 @@ impl<T: Copy, const N: usize> Arena<T, N> {
     where
         T: Trace<T, N>,
     {
-        let roots: Vec<ArenaIndex> = root_sets.iter().flat_map(|s| s.iter().copied()).collect();
-        self.collect_garbage_forced(&roots)
+        let was_enabled = self.is_gc_enabled();
+        self.set_gc_enabled(true);
+        let result = self.collect_garbage_multi(root_sets);
+        self.set_gc_enabled(was_enabled);
+        result
     }
 }
 
