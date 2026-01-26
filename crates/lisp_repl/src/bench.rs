@@ -400,46 +400,50 @@ fn main() {
     println!();
 
     // ═══════════════════════════════════════════════════════════════════════
-    // SECTION 5: Thunks & Lazy Evaluation
+    // SECTION 5: Lazy Evaluation (automatic)
     // ═══════════════════════════════════════════════════════════════════════
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("Section 5: Thunks & Lazy Evaluation");
+    println!("Section 5: Lazy Evaluation (everything is lazy by default!)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
+    // cons is non-strict - builds pairs with unevaluated elements
     results.push(run_bench(
-        "Create thunk x 200",
+        "Non-strict cons x 200",
         &lisp,
         &mut eval,
         200,
-        "(delay (+ 1 2 3 4 5))",
+        "(cons (+ 1 2) (+ 3 4))",
         None,
     ));
 
-    // Force memoization test - simplified
+    // Accessing element forces it
     results.push(run_bench(
-        "Force immediate x 200",
+        "car (forces elem) x 200",
         &lisp,
         &mut eval,
         200,
-        "(force (delay (* 3 333)))",
+        "(car (cons (* 3 333) 0))",
         Some("999"),
     ));
 
+    // Conditional only evaluates selected branch (lazy branches)
     results.push(run_bench(
-        "promise? predicate x 100",
+        "if branch selection x 100",
         &lisp,
         &mut eval,
         100,
-        "(promise? (delay 42))",
-        Some("#t"),
+        "(if #t 42 (error 'never-evaluated))",
+        Some("42"),
     ));
 
+    // HYBRID: Lambda args are strict (enables TCO)
+    let _ = eval_str(&lisp, &mut eval, "(define (strict-first x y) x)");
     results.push(run_bench(
-        "Delay+Force cycle x 100",
+        "Strict lambda args x 100",
         &lisp,
         &mut eval,
         100,
-        "(force (delay (+ 10 20 30)))",
+        "(strict-first 60 100)",
         Some("60"),
     ));
 

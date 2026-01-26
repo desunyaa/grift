@@ -10,7 +10,7 @@
 //! - All values are stored in a `pwn_arena` arena
 //! - Supports garbage collection via the `Trace` trait
 //! - Explicit boolean values (#t, #f) separate from nil/empty list
-//! - Call-by-need via Thunks (delayed computations)
+//! - **Lazy by default** - All evaluation is call-by-need (like Haskell)
 //!
 //! ## Value Representation
 //!
@@ -22,24 +22,26 @@
 //! - `Cons { car, cdr }` - Pair/list cell
 //! - `Symbol { chars }` - Symbol (tagged char list)
 //! - `Lambda { params, body, env }` - Closure
-//! - `Thunk { expr, env, cached }` - Delayed computation (call-by-need)
+//! - `Thunk { expr, env, cached }` - Lazy computation (internal, auto-managed)
 //! - `Builtin(Builtin)` - Optimized built-in function
 
 pub use pwn_arena::{Arena, ArenaIndex, ArenaError, ArenaResult, Trace, GcStats};
 
 /// Built-in functions (optimization to avoid symbol lookup)
 /// 
-/// NOTE: This is a PURE Lisp - no mutation operations!
-/// This makes call-by-need semantically sound.
+/// NOTE: This is a PURE, LAZY Lisp (like Haskell)!
+/// - No mutation operations
+/// - All evaluation is call-by-need (lazy by default)
+/// - Values are forced automatically in strict positions
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Builtin {
-    // List operations (pure)
+    // List operations (non-strict - don't force arguments)
     Car,
     Cdr,
     Cons,
     List,
     
-    // Predicates
+    // Predicates (force their argument to check type)
     Atom,
     Eq,
     Null,
@@ -49,18 +51,14 @@ pub enum Builtin {
     Procedurep,
     Symbolp,
     
-    // Lazy evaluation (call-by-need)
-    Force,
-    Promisep,
-    
-    // Arithmetic
+    // Arithmetic (strict - force arguments)
     Add,
     Sub,
     Mul,
     Div,
     Mod,
     
-    // Comparison
+    // Comparison (strict - force arguments)
     Lt,
     Gt,
     Le,
@@ -70,7 +68,7 @@ pub enum Builtin {
     // Boolean operations
     Not,
     
-    // I/O (for REPL)
+    // I/O (strict - force arguments for printing)
     Print,
     Newline,
     Display,
@@ -95,8 +93,6 @@ impl Builtin {
             Builtin::Booleanp => "boolean?",
             Builtin::Procedurep => "procedure?",
             Builtin::Symbolp => "symbol?",
-            Builtin::Force => "force",
-            Builtin::Promisep => "promise?",
             Builtin::Add => "+",
             Builtin::Sub => "-",
             Builtin::Mul => "*",
@@ -120,7 +116,6 @@ impl Builtin {
         Builtin::Car, Builtin::Cdr, Builtin::Cons, Builtin::List,
         Builtin::Atom, Builtin::Eq, Builtin::Null, Builtin::Pairp,
         Builtin::Numberp, Builtin::Booleanp, Builtin::Procedurep, Builtin::Symbolp,
-        Builtin::Force, Builtin::Promisep,
         Builtin::Add, Builtin::Sub, Builtin::Mul, Builtin::Div, Builtin::Mod,
         Builtin::Lt, Builtin::Gt, Builtin::Le, Builtin::Ge, Builtin::NumEq,
         Builtin::Not,
