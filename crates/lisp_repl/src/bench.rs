@@ -223,38 +223,69 @@ fn main() {
     );
 
     results.push(run_bench(
-        "Factorial(8) x 100",
+        "Factorial(10) x 100",
         &lisp,
         &mut eval,
         100,
-        "(factorial 8)",
-        Some("40320"),
+        "(factorial 10)",
+        Some("3628800"),
+    ));
+
+    // Fibonacci - exponential time, tree recursion uses lots of memory
+    // fib(n) makes O(2^n) calls, each needs stack space
+    results.push(run_bench(
+        "Fibonacci(12) x 5",
+        &lisp,
+        &mut eval,
+        5,
+        "(fib 12)",
+        Some("144"),
     ));
 
     results.push(run_bench(
-        "Fibonacci(10) x 10",
+        "Fibonacci(20) x 1",
+        &lisp,
+        &mut eval,
+        1,
+        "(fib 20)",
+        Some("6765"),
+    ));
+
+    // TCO tests - trampolining enables deeper recursion (limited by arena, not stack)
+    // Memory accumulates across iterations, so we balance depth vs iterations
+    results.push(run_bench(
+        "TCO Sum 1..150 x 10",
         &lisp,
         &mut eval,
         10,
-        "(fib 10)",
-        Some("55"),
+        "(sum-to-tco 150 0)",
+        Some("11325"),
     ));
 
     results.push(run_bench(
-        "TCO Sum 1..100 x 20",
+        "TCO Sum 1..200 x 10",
         &lisp,
         &mut eval,
-        20,
-        "(sum-to-tco 100 0)",
-        Some("5050"),
+        10,
+        "(sum-to-tco 200 0)",
+        Some("20100"),
     ));
 
     results.push(run_bench(
-        "TCO countdown 100 x 20",
+        "TCO countdown 150 x 20",
         &lisp,
         &mut eval,
         20,
-        "(count-down 100)",
+        "(count-down 150)",
+        Some("done"),
+    ));
+
+    results.push(run_bench(
+        "TCO countdown 200 x 10",
+        &lisp,
+        &mut eval,
+        10,
+        "(count-down 200)",
         Some("done"),
     ));
 
