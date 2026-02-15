@@ -685,3 +685,34 @@ fn test_tco_iterative_fib() {
     "#);
     assert_eq!(result, Ok(Value::Number(6765)));
 }
+
+// ============================================================================
+// GC Under Pressure: Recursive Fibonacci
+// ============================================================================
+
+#[test]
+fn test_recursive_fib_with_gc() {
+    // Recursive (non-tail) fib that requires GC to complete.
+    // With a 5000-slot arena, fib(15) needs GC to reclaim intermediate values.
+    let lisp: Lisp<5000> = Lisp::new();
+    let result = lisp.eval(r#"
+        (begin
+            (define (fib n)
+                (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2)))))
+            (fib 15))
+    "#);
+    assert_eq!(result, Ok(Value::Number(610)));
+}
+
+#[test]
+fn test_recursive_fib_25() {
+    // Larger recursive fib requiring many GC cycles.
+    let lisp: Lisp<20000> = Lisp::new();
+    let result = lisp.eval(r#"
+        (begin
+            (define (fib n)
+                (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2)))))
+            (fib 25))
+    "#);
+    assert_eq!(result, Ok(Value::Number(75025)));
+}
