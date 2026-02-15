@@ -46,7 +46,7 @@ pub fn sym_eq(
     let mut idx = start.raw() + 1;
     for ch in name.chars() {
         match arena.get(ArenaIndex::new(idx)).unwrap() {
-            Value::Int(c) if c as u8 as char == ch => {}
+            Value::Int(c) if c == ch as i64 => {}
             _ => return false,
         }
         idx += 1;
