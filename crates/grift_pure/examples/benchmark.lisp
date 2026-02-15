@@ -32,7 +32,7 @@
 ;;   fib(10)  =        55   — ~1K   calls, instant
 ;;   fib(20)  =      6765   — ~1M   calls, measurable
 ;;   fib(30)  =    832040   — ~1B   calls, seconds
-;;   fib(40)  = 102334155   — ~1T   calls, push the limits
+;;   fib(40)  = 102334155   — ~2^40 calls, push the limits
 
 ;;; =========================================================================
 ;;; Benchmark 2: Tail-recursive countdown

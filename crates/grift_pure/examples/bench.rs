@@ -419,9 +419,16 @@ fn main() {
     println!("═══════════════════════════════════════════════════════════════════");
 }
 
-/// Native Rust fibonacci for computing expected values.
+/// Native iterative fibonacci for computing expected values.
 fn naive_fib(n: i64) -> i64 {
-    if n < 2 { n } else { naive_fib(n - 1) + naive_fib(n - 2) }
+    if n < 2 { return n; }
+    let (mut a, mut b) = (0i64, 1i64);
+    for _ in 2..=n {
+        let c = a + b;
+        a = b;
+        b = c;
+    }
+    b
 }
 
 /// Native Rust Ackermann for computing expected values.
