@@ -245,9 +245,12 @@ impl<const N: usize> Trace<Value, N> for Value {
                 tracer(params);
                 tracer(body_env);
             }
-            Value::String { data, .. } => {
+            Value::String { len, data } => {
                 if !data.is_nil() {
-                    tracer(data);
+                    // Trace all contiguous character slots
+                    for i in 0..len {
+                        tracer(ArenaIndex::new(data.raw() + i));
+                    }
                 }
             }
             Value::Thunk { expr, env } => {

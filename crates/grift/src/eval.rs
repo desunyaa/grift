@@ -141,10 +141,17 @@ enum TailAction {
     Continue,
 }
 
+/// Maximum number of GC root slots for tracking live values during recursive evaluation.
+const MAX_GC_ROOTS: usize = 256;
+
 /// The evaluator state.
 pub(crate) struct Evaluator<'a, const N: usize> {
     lisp: &'a Lisp<N>,
     pub global_env: ArenaIndex,
+    /// Stack of GC roots: ArenaIndex values that must survive garbage collection.
+    /// These are pushed before recursive eval/force calls and popped after.
+    gc_roots: [ArenaIndex; MAX_GC_ROOTS],
+    gc_roots_len: usize,
 }
 
 /// Bind a name to a value in an environment, returning the new environment.
@@ -210,9 +217,42 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         let mut eval = Evaluator {
             lisp,
             global_env: env,
+            gc_roots: [ArenaIndex::NIL; MAX_GC_ROOTS],
+            gc_roots_len: 0,
         };
         eval.init_builtins();
         eval
+    }
+
+    /// Push a GC root onto the root stack.
+    fn push_root(&mut self, idx: ArenaIndex) {
+        if self.gc_roots_len < MAX_GC_ROOTS {
+            self.gc_roots[self.gc_roots_len] = idx;
+            self.gc_roots_len += 1;
+        }
+    }
+
+    /// Pop `count` roots from the root stack.
+    fn pop_roots(&mut self, count: usize) {
+        self.gc_roots_len = self.gc_roots_len.saturating_sub(count);
+    }
+
+    /// Trigger GC if the arena is nearly full.
+    /// Uses global_env, expr, env, and the root stack as GC roots.
+    fn maybe_gc(&self, expr: ArenaIndex, env: ArenaIndex) {
+        let len = self.lisp.arena.len();
+        let cap = self.lisp.arena.capacity();
+        // Trigger GC when arena is more than 75% full
+        if len * 4 > cap * 3 {
+            self.run_gc(expr, env);
+        }
+    }
+
+    /// Run garbage collection with the evaluator's live roots.
+    fn run_gc(&self, expr: ArenaIndex, env: ArenaIndex) {
+        let fixed_roots = [self.global_env, expr, env];
+        let stack_roots = &self.gc_roots[..self.gc_roots_len];
+        self.lisp.arena.collect_garbage_multi(&[&fixed_roots, stack_roots]);
     }
 
     /// Force a value to Weak Head Normal Form (WHNF), memoizing the result.
@@ -240,7 +280,10 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                     self.lisp.arena.set(thunk_idx, Value::BlackHole)?;
 
                     // Step 2: Evaluate the expression to WHNF.
+                    // Protect thunk_idx from GC (it's a BlackHole, not reachable from roots).
+                    self.push_root(thunk_idx);
                     let result = self.eval(expr, env)?;
+                    self.pop_roots(1);
 
                     // Step 3: Follow indirections in result to detect cycles.
                     let mut final_result = result;
@@ -277,6 +320,9 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     /// Evaluate an expression in an environment (with TCO).
     pub fn eval(&mut self, mut expr: ArenaIndex, mut env: ArenaIndex) -> ArenaResult<ArenaIndex> {
         loop {
+            // Trigger GC if the arena is getting full
+            self.maybe_gc(expr, env);
+
             let val = self.lisp.get(expr)?;
 
             match val {
@@ -333,6 +379,9 @@ impl<'a, const N: usize> Evaluator<'a, N> {
 
                     // Function application (call-by-need):
                     // Step 1: Evaluate the operator to WHNF.
+                    // Protect cdr and env as roots since they're needed throughout application.
+                    self.push_root(cdr);
+                    self.push_root(env);
                     let func_idx = self.eval(car, env)?;
                     let func_whnf = self.force(func_idx)?;
 
@@ -340,6 +389,7 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                         // Builtin — strict in all arguments.
                         Value::Builtin(id) => {
                             let args = self.force_args(cdr, env)?;
+                            self.pop_roots(2);
                             return self.apply_builtin(id, args);
                         }
 
@@ -348,10 +398,14 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                             let (params, body, closed_env) = self.lisp.lambda_parts(func_whnf)?;
                             env = self.bind_args_lazy(closed_env, params, cdr, env)?;
                             expr = body;
+                            self.pop_roots(2);
                             continue; // ← TCO: no Rust stack frame
                         }
 
-                        _ => return Err(ArenaError::InvalidIndex),
+                        _ => {
+                            self.pop_roots(2);
+                            return Err(ArenaError::InvalidIndex);
+                        }
                     }
                 }
             }
@@ -416,6 +470,7 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     }
 
     /// Evaluate and force all arguments in a list (for strict builtins).
+    /// Uses an iterative approach to avoid deep recursion and simplify GC root tracking.
     fn force_args(
         &mut self,
         args: ArenaIndex,
@@ -424,14 +479,38 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         if args.is_nil() {
             return self.lisp.nil();
         }
-        let head_expr = self.lisp.car(args)?;
-        let head_val = self.eval(head_expr, env)?;
-        let head_forced = self.force(head_val)?;
 
-        let tail = self.lisp.cdr(args)?;
-        let tail_forced = self.force_args(tail, env)?;
+        // Evaluate and force each argument, collecting results.
+        // We build the list in reverse then reverse it.
+        let mut reversed = ArenaIndex::NIL;
+        let mut cur = args;
+        let root_base = self.gc_roots_len;
 
-        self.lisp.cons(head_forced, tail_forced)
+        while !cur.is_nil() {
+            let head_expr = self.lisp.car(cur)?;
+            // Protect cur, env, and reversed from GC during eval/force
+            self.push_root(cur);
+            self.push_root(env);
+            self.push_root(reversed);
+            let head_val = self.eval(head_expr, env)?;
+            let head_forced = self.force(head_val)?;
+            self.gc_roots_len = root_base; // restore gc_roots
+
+            // Cons head_forced onto the reversed list
+            reversed = self.lisp.cons(head_forced, reversed)?;
+            cur = self.lisp.cdr(cur)?;
+        }
+
+        // Reverse the list to get the correct order
+        let mut result = ArenaIndex::NIL;
+        let mut rev = reversed;
+        while !rev.is_nil() {
+            let head = self.lisp.car(rev)?;
+            result = self.lisp.cons(head, result)?;
+            rev = self.lisp.cdr(rev)?;
+        }
+
+        Ok(result)
     }
 
     // ========================================================================
@@ -460,8 +539,11 @@ impl<'a, const N: usize> Evaluator<'a, N> {
             let rest = self.lisp.cdr(args)?;
 
             // Non-tail: evaluate and force the test
+            // Protect rest from GC during recursive eval
+            self.push_root(rest);
             let test_val = self.eval(test_expr, *env)?;
             let test_forced = self.force(test_val)?;
+            self.pop_roots(1);
             let is_false = matches!(self.lisp.get(test_forced)?, Value::False);
 
             if !is_false {
@@ -540,8 +622,11 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     ) -> ArenaResult<ArenaIndex> {
         let name = self.lisp.car(args)?;
         let expr = self.lisp.car(self.lisp.cdr(args)?)?;
+        // Protect name from GC during recursive eval
+        self.push_root(name);
         let val = self.eval(expr, env)?;
         let forced = self.force(val)?;
+        self.pop_roots(1);
 
         // Try local env first, then global
         if env_set(self.lisp, env, name, forced).is_ok() {
@@ -590,7 +675,10 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                 }
                 // Non-last — evaluate (non-tail) and discard result
                 let e = self.lisp.car(cur)?;
+                // Protect next from GC during recursive eval
+                self.push_root(next);
                 self.eval(e, *env)?;
+                self.pop_roots(1);
                 cur = next;
             }
             *expr = self.lisp.nil()?;
@@ -630,8 +718,12 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                 return self.eval_begin_inner(body, *env);
             }
 
+            // Protect body and cur from GC during recursive eval
+            self.push_root(body);
+            self.push_root(cur);
             let test_val = self.eval(test, *env)?;
             let test_forced = self.force(test_val)?;
+            self.pop_roots(2);
             if !matches!(self.lisp.get(test_forced)?, Value::False) {
                 return self.eval_begin_inner(body, *env);
             }
@@ -650,7 +742,10 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         let mut result = self.lisp.nil()?;
         while !cur.is_nil() {
             let e = self.lisp.car(cur)?;
+            // Protect cur from GC during recursive eval
+            self.push_root(cur);
             result = self.eval(e, env)?;
+            self.pop_roots(1);
             cur = self.lisp.cdr(cur)?;
         }
         Ok(result)
@@ -673,8 +768,11 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                     return Ok(());
                 }
                 let e = self.lisp.car(cur)?;
+                // Protect next from GC during recursive eval
+                self.push_root(next);
                 let result = self.eval(e, *env)?;
                 let forced = self.force(result)?;
+                self.pop_roots(1);
                 if matches!(self.lisp.get(forced)?, Value::False) {
                     // Short-circuit: need to return false directly
                     // We set expr to the false value (self-evaluating)
@@ -711,8 +809,11 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                     return Ok(());
                 }
                 let e = self.lisp.car(cur)?;
+                // Protect next from GC during recursive eval
+                self.push_root(next);
                 let result = self.eval(e, *env)?;
                 let forced = self.force(result)?;
+                self.pop_roots(1);
                 if !matches!(self.lisp.get(forced)?, Value::False) {
                     // Short-circuit: return the truthy value
                     *expr = forced;

@@ -26,11 +26,10 @@ fn main() {
 fn run_benchmark() {
     let lisp: Lisp<500_000> = Lisp::new();
 
-    // Iterative Fibonacci via self-application (no `define` needed).
-    // (fib 30) crashes due to out of memory but 20 works
+    // Recursive Fibonacci using define.
     let program = r#"
       (begin   (define (fib n) (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2)))))
-      (fib 20) )
+      (fib 30) )
     "#;
 
     let start = std::time::Instant::now();
@@ -39,7 +38,7 @@ fn run_benchmark() {
 
     match result {
         Ok(Value::Number(n)) => {
-            println!("fib(20) = {n}");
+            println!("fib(30) = {n}");
             println!("elapsed: {elapsed:.3?}");
         }
         Ok(other) => {
