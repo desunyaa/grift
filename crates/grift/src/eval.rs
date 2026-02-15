@@ -142,7 +142,11 @@ enum TailAction {
 }
 
 /// Maximum number of GC root slots for tracking live values during recursive evaluation.
-const MAX_GC_ROOTS: usize = 256;
+const MAX_GC_ROOTS: usize = 1024;
+
+/// GC threshold: trigger collection when arena occupancy exceeds this fraction (3/4 = 75%).
+const GC_THRESHOLD_NUMERATOR: usize = 3;
+const GC_THRESHOLD_DENOMINATOR: usize = 4;
 
 /// The evaluator state.
 pub(crate) struct Evaluator<'a, const N: usize> {
@@ -225,11 +229,19 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     }
 
     /// Push a GC root onto the root stack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the root stack overflows. This indicates evaluation has
+    /// exceeded the maximum supported nesting depth.
     fn push_root(&mut self, idx: ArenaIndex) {
-        if self.gc_roots_len < MAX_GC_ROOTS {
-            self.gc_roots[self.gc_roots_len] = idx;
-            self.gc_roots_len += 1;
-        }
+        assert!(
+            self.gc_roots_len < MAX_GC_ROOTS,
+            "GC root stack overflow: exceeded {} roots",
+            MAX_GC_ROOTS
+        );
+        self.gc_roots[self.gc_roots_len] = idx;
+        self.gc_roots_len += 1;
     }
 
     /// Pop `count` roots from the root stack.
@@ -242,8 +254,7 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     fn maybe_gc(&self, expr: ArenaIndex, env: ArenaIndex) {
         let len = self.lisp.arena.len();
         let cap = self.lisp.arena.capacity();
-        // Trigger GC when arena is more than 75% full
-        if len * 4 > cap * 3 {
+        if len * GC_THRESHOLD_DENOMINATOR > cap * GC_THRESHOLD_NUMERATOR {
             self.run_gc(expr, env);
         }
     }
@@ -494,7 +505,7 @@ impl<'a, const N: usize> Evaluator<'a, N> {
             self.push_root(reversed);
             let head_val = self.eval(head_expr, env)?;
             let head_forced = self.force(head_val)?;
-            self.gc_roots_len = root_base; // restore gc_roots
+            self.pop_roots(self.gc_roots_len - root_base);
 
             // Cons head_forced onto the reversed list
             reversed = self.lisp.cons(head_forced, reversed)?;

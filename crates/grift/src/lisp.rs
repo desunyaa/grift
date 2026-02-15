@@ -247,7 +247,8 @@ impl<const N: usize> Trace<Value, N> for Value {
             }
             Value::String { len, data } => {
                 if !data.is_nil() {
-                    // Trace all contiguous character slots
+                    // String characters are stored in `len` consecutive arena slots
+                    // starting at index `data`. Trace each slot so GC keeps them alive.
                     for i in 0..len {
                         tracer(ArenaIndex::new(data.raw() + i));
                     }
