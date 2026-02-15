@@ -829,3 +829,146 @@ fn test_infinite_list_car() {
     let (result, _) = eval_sequence(&arena, program, env).unwrap();
     assert_eq!(get_int(&arena, result), 1);
 }
+
+// ============================================================================
+// Fibonacci — correctness and timed benchmark
+// ============================================================================
+
+/// Build the recursive fibonacci program AST:
+///   (def (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+///   (fib <input>)
+fn build_fib_program(arena: &Arena<Value, ARENA_SIZE>, input: i64) -> ArenaIndex {
+    let def = sym(arena, "def");
+    let fib = sym(arena, "fib");
+    let n = sym(arena, "n");
+    let if_sym = sym(arena, "if");
+    let lt = sym(arena, "<");
+    let plus = sym(arena, "+");
+    let minus = sym(arena, "-");
+
+    // (< n 2)
+    let n_ref1 = sym(arena, "n");
+    let two = arena.alloc(Value::Int(2)).unwrap();
+    let cond = list(arena, &[lt, n_ref1, two]);
+
+    // (- n 1)
+    let n_ref2 = sym(arena, "n");
+    let one1 = arena.alloc(Value::Int(1)).unwrap();
+    let n_minus_1 = list(arena, &[minus, n_ref2, one1]);
+
+    // (- n 2)
+    let n_ref3 = sym(arena, "n");
+    let two2 = arena.alloc(Value::Int(2)).unwrap();
+    let n_minus_2 = list(arena, &[minus, n_ref3, two2]);
+
+    // (fib (- n 1))
+    let fib_ref1 = sym(arena, "fib");
+    let fib_n1 = list(arena, &[fib_ref1, n_minus_1]);
+
+    // (fib (- n 2))
+    let fib_ref2 = sym(arena, "fib");
+    let fib_n2 = list(arena, &[fib_ref2, n_minus_2]);
+
+    // (+ (fib (- n 1)) (fib (- n 2)))
+    let sum = list(arena, &[plus, fib_n1, fib_n2]);
+
+    // base case: n
+    let n_ref4 = sym(arena, "n");
+
+    // (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))
+    let body = list(arena, &[if_sym, cond, n_ref4, sum]);
+
+    // (def (fib n) ...)
+    let name_params = list(arena, &[fib, n]);
+    let def_expr = list(arena, &[def, name_params, body]);
+
+    // (fib <input>)
+    let fib_call = sym(arena, "fib");
+    let input_val = arena.alloc(Value::Int(input)).unwrap();
+    let call = list(arena, &[fib_call, input_val]);
+
+    list(arena, &[def_expr, call])
+}
+
+#[test]
+fn test_fib_base_cases() {
+    let arena = new_arena();
+    let env = default_env(&arena);
+
+    // fib(0) = 0
+    let program = build_fib_program(&arena, 0);
+    let (result, _) = eval_sequence(&arena, program, env).unwrap();
+    assert_eq!(get_int(&arena, result), 0);
+}
+
+#[test]
+fn test_fib_1() {
+    let arena = new_arena();
+    let env = default_env(&arena);
+
+    let program = build_fib_program(&arena, 1);
+    let (result, _) = eval_sequence(&arena, program, env).unwrap();
+    assert_eq!(get_int(&arena, result), 1);
+}
+
+#[test]
+fn test_fib_10() {
+    let arena = new_arena();
+    let env = default_env(&arena);
+
+    let program = build_fib_program(&arena, 10);
+    let (result, _) = eval_sequence(&arena, program, env).unwrap();
+    assert_eq!(get_int(&arena, result), 55);
+}
+
+#[test]
+fn test_fib_12() {
+    // fib(12) = 144 — stress test for the tree-walking CPS evaluator
+    // with the default 65536-slot arena
+    let arena = new_arena();
+    let env = default_env(&arena);
+
+    let program = build_fib_program(&arena, 12);
+    let (result, _) = eval_sequence(&arena, program, env).unwrap();
+    assert_eq!(get_int(&arena, result), 144);
+}
+
+#[test]
+fn test_fib_40_exceeds_arena() {
+    // fib(40) = 102334155 — this is far beyond what the default 65536-slot
+    // arena can handle with naive recursive evaluation. Each recursive call
+    // allocates arena slots for continuation frames, environment extensions,
+    // and intermediate values. The exponential O(2^n) call tree exhausts
+    // the arena well before fib(40).
+    //
+    // This test documents that fib(40) correctly fails with OutOfMemory
+    // rather than silently producing a wrong answer or stack-overflowing.
+    let arena = new_arena();
+    let env = default_env(&arena);
+
+    let program = build_fib_program(&arena, 40);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eval_sequence(&arena, program, env)
+    }));
+
+    // Should panic with OutOfMemory (arena exhausted)
+    assert!(result.is_err(), "fib(40) should exhaust the 65536-slot arena");
+}
+
+#[test]
+fn test_fib_execution_time() {
+    // Time the execution of fib(10) to establish a baseline measurement.
+    // This test always passes — it just prints timing info.
+    let arena = new_arena();
+    let env = default_env(&arena);
+
+    let program = build_fib_program(&arena, 10);
+    let start = std::time::Instant::now();
+    let (result, _) = eval_sequence(&arena, program, env).unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(get_int(&arena, result), 55);
+
+    // Print timing for visibility in test output (cargo test -- --nocapture)
+    eprintln!("fib(10) = 55, elapsed: {:?}", elapsed);
+}
