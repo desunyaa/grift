@@ -1083,9 +1083,9 @@ the continuation at all, similar to Koka's tail-resumption optimization
 7. Handler: `(lambda (_) ((k₂ ()) 1))` — continues with state `1`.
 8. `(k₂ ())` resumes, evaluates `(perform get)` with state `1`.
 9. Captures `k₃ = □` (trivial continuation).
-10. Handler: `(lambda (s) ((k₃ s) s))` → `(lambda (s) (s s))` → applied with `1`.
-11. `k₃` resumes with `1`, return clause: `(lambda (s) 1)`.
-12. Applied to state `1`: result is `1`.
+10. Handler: `(lambda (s) ((k₃ s) s))` — since `k₃` is trivial, `(k₃ s)` evaluates to `s`, giving `(lambda (s) s)`.
+11. Applied to state `1`: `(lambda (s) s)` returns `1`.
+12. Return clause wraps result: `(lambda (s) 1)`, applied to state `1`, yields `1`.
 
 ### 12.3 Generator / Iterator
 
@@ -1144,7 +1144,7 @@ the continuation at all, similar to Koka's tail-resumption optimization
 
 2. **No static effect typing.** Grift is dynamically typed, so unhandled
    effects are caught at runtime, not compile time. A future type system
-   could use row-typed effects [17] to provide static guarantees.
+   could use row-typed effects [11, 17] to provide static guarantees.
 
 3. **Arena pressure from continuations.** Deep continuations consume
    significant arena space. Programs with deeply nested effect handling
@@ -1247,8 +1247,9 @@ the continuation at all, similar to Koka's tail-resumption optimization
 [16] D. Leijen, "Implementing Algebraic Effects in C," *Asian Symposium
      on Programming Languages and Systems (APLAS)*, pp. 339–363, 2017.
 
-[17] S. Lindley, C. McBride, and C. McLaughlin, "Do Be Do Be Do,"
-     *Principles of Programming Languages (POPL)*, pp. 500–514, 2017.
+[17] S. Lindley, "Algebraic Effects and Effect Handlers for Idioms and
+     Arrows," *Workshop on Effect and Resource Management (WERM)*,
+     pp. 5:1–5:12, 2014.
 
 [18] D. Hillerström and S. Lindley, "Shallow Effect Handlers,"
      *Asian Symposium on Programming Languages and Systems (APLAS)*,
