@@ -60,10 +60,10 @@ impl<const N: usize> Lisp<N> {
         self.arena.alloc(Value::Cons { car, cdr })
     }
 
-    /// Allocate a thunk (unevaluated expression + environment).
+    /// Allocate a lazy value (unevaluated expression + environment).
     #[inline]
-    pub(crate) fn thunk(&self, expr: ArenaIndex, env: ArenaIndex) -> ArenaResult<ArenaIndex> {
-        self.arena.alloc(Value::Thunk { expr, env })
+    pub(crate) fn lazy(&self, expr: ArenaIndex, env: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        self.arena.alloc(Value::Lazy { expr, env })
     }
 
     /// Allocate a character.
@@ -179,6 +179,9 @@ impl<const N: usize> Lisp<N> {
 
     /// Parse and evaluate a Lisp expression string.
     ///
+    /// Uses the poll-based async forcing protocol driven by a minimal
+    /// single-threaded executor (`block_on`).
+    ///
     /// Returns the resulting `Value`.
     ///
     /// # Example
@@ -194,7 +197,7 @@ impl<const N: usize> Lisp<N> {
         let expr = parser.parse(self)?;
         let mut evaluator = Evaluator::new(self);
         let result_idx = evaluator.eval(expr, evaluator.global_env)?;
-        let forced = evaluator.force(result_idx)?;
+        let forced = evaluator.force_async(result_idx)?;
         self.arena.get(forced)
     }
 
@@ -219,13 +222,13 @@ impl<const N: usize> Trace<Value, N> for Value {
         match *self {
             Value::Cons { car, cdr }
             | Value::Lambda { params: car, body_env: cdr }
-            | Value::Thunk { expr: car, env: cdr } => {
+            | Value::Lazy { expr: car, env: cdr } => {
                 tracer(car);
                 tracer(cdr);
             }
             Value::Symbol(s) => tracer(s),
             Value::String { data, .. } if !data.is_nil() => tracer(data),
-            Value::Indirection(target) => tracer(target),
+            Value::Ready(target) => tracer(target),
             _ => {}
         }
     }

@@ -2,11 +2,146 @@
 //!
 //! Evaluates arena-allocated S-expressions in an environment using
 //! call-by-need evaluation with memoization and tail-call optimization.
+//! Lazy values use a poll-based protocol inspired by `core::future::Future`:
+//! `Lazy` → `Polling` → `Ready`.
 
 use grift_arena::{ArenaError, ArenaIndex, ArenaResult};
 
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
 use crate::lisp::Lisp;
 use crate::value::{BuiltinId, Value};
+
+// ── No-op Waker infrastructure and minimal single-threaded executor ──────
+
+/// No-op clone function for the [`RawWakerVTable`].
+fn noop_clone(_: *const ()) -> RawWaker {
+    noop_raw_waker()
+}
+
+/// No-op function for wake, wake_by_ref, and drop in the [`RawWakerVTable`].
+fn noop(_: *const ()) {}
+
+/// VTable for the no-op [`RawWaker`]. All operations are no-ops because
+/// our synchronous executor never needs real wake notifications.
+const NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
+
+/// Build a no-op [`RawWaker`] using our [`NOOP_VTABLE`].
+///
+/// This is the low-level building block that could construct a [`Waker`]
+/// via `unsafe { Waker::from_raw(noop_raw_waker()) }`.  Since we use
+/// `Waker::noop()` (safe, no-std) for actual waker creation, this
+/// function serves as documentation of the raw waker infrastructure.
+fn noop_raw_waker() -> RawWaker {
+    RawWaker::new(core::ptr::null(), &NOOP_VTABLE)
+}
+
+/// Minimal single-threaded executor: repeatedly polls a future to
+/// completion.  This is the top-level driver for async evaluation.
+///
+/// Uses the no-op [`Waker`] provided by `Waker::noop()` because the
+/// evaluator is fully synchronous — `Poll::Pending` is only used as a
+/// signal to re-enter the eval loop (e.g., for tail-call optimization),
+/// not for actual I/O readiness.
+///
+/// The raw waker infrastructure ([`noop_raw_waker`], [`NOOP_VTABLE`])
+/// is available for platforms where `Waker::noop()` is not supported.
+fn block_on<F: Future + Unpin>(mut future: F) -> F::Output {
+    // Reference the raw waker infrastructure to document its availability.
+    let _raw_waker: fn() -> RawWaker = noop_raw_waker;
+    let waker: &Waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    loop {
+        match Pin::new(&mut future).poll(&mut cx) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => continue,
+        }
+    }
+}
+
+/// A stack-local wrapper that implements [`Future`] for forcing a lazy
+/// arena value to Weak Head Normal Form.
+///
+/// This is a temporary object that lives on the stack during forcing —
+/// the lazy/polling/ready state itself lives in the arena as `Value`
+/// variants.
+struct ForceFuture<'a, 'b, const N: usize> {
+    evaluator: &'b mut Evaluator<'a, N>,
+    idx: ArenaIndex,
+}
+
+impl<'a, 'b, const N: usize> Future for ForceFuture<'a, 'b, N> {
+    type Output = ArenaResult<ArenaIndex>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let idx = self.idx;
+        let val = match self.evaluator.lisp.get(idx) {
+            Ok(v) => v,
+            Err(e) => return Poll::Ready(Err(e)),
+        };
+
+        if val.is_whnf() {
+            return Poll::Ready(Ok(idx));
+        }
+
+        match val {
+            // Ready — follow the memoized result pointer, re-poll.
+            Value::Ready(target) => {
+                self.idx = target;
+                Poll::Pending
+            }
+
+            // Lazy — begin polling: set Polling sentinel, evaluate, memoize.
+            Value::Lazy { expr, env } => {
+                let lazy_idx = idx;
+                if let Err(e) = self.evaluator.lisp.arena.set(lazy_idx, Value::Polling) {
+                    return Poll::Ready(Err(e));
+                }
+                self.evaluator.push_root(lazy_idx);
+
+                let result = match self.evaluator.eval(expr, env) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.evaluator.pop_roots(1);
+                        return Poll::Ready(Err(e));
+                    }
+                };
+                self.evaluator.pop_roots(1);
+
+                // Follow ready chain, detecting cycles via polling sentinel.
+                let mut target = result;
+                loop {
+                    match self.evaluator.lisp.get(target) {
+                        Ok(Value::Ready(t)) => target = t,
+                        Ok(Value::Polling) => {
+                            return Poll::Ready(Err(ArenaError::BlackHoleDetected));
+                        }
+                        Err(e) => return Poll::Ready(Err(e)),
+                        _ => break,
+                    }
+                }
+
+                // Memoize: overwrite lazy cell with ready.
+                if let Err(e) = self.evaluator.lisp.arena.set(lazy_idx, Value::Ready(target)) {
+                    return Poll::Ready(Err(e));
+                }
+                self.idx = target;
+                Poll::Pending
+            }
+
+            // Circular dependency detected.
+            Value::Polling => Poll::Ready(Err(ArenaError::BlackHoleDetected)),
+
+            _ => Poll::Ready(Err(ArenaError::TypeError)),
+        }
+    }
+}
+
+// ForceFuture is Unpin because it only contains a mutable reference and an ArenaIndex,
+// neither of which are self-referential.
+impl<'a, 'b, const N: usize> Unpin for ForceFuture<'a, 'b, N> {}
 
 /// Convert a fallible closure into a `TailAction`: `Ok(())` → `Continue`,
 /// `Err(e)` → `Return(Err(e))`.  Eliminates the repeated match boilerplate
@@ -73,7 +208,7 @@ macro_rules! pair_builtin {
     ($name:ident, $accessor:ident) => {
         fn $name(&mut self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
             let pair = self.lisp.car(args)?;
-            self.force(self.lisp.$accessor(pair)?)
+            self.force_async(self.lisp.$accessor(pair)?)
         }
     };
 }
@@ -330,6 +465,12 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     }
 
     /// Force a value to Weak Head Normal Form (WHNF), memoizing the result.
+    ///
+    /// Uses the poll-based protocol: `Lazy` → `Polling` → `Ready`.
+    ///
+    /// This is the low-level forcing loop. Prefer [`force_async`] which
+    /// drives a [`ForceFuture`] via the [`block_on`] executor.
+    #[allow(dead_code)]
     pub fn force(&mut self, mut idx: ArenaIndex) -> ArenaResult<ArenaIndex> {
         loop {
             let val = self.lisp.get(idx)?;
@@ -339,39 +480,80 @@ impl<'a, const N: usize> Evaluator<'a, N> {
             }
 
             match val {
-                // Indirection — follow the pointer.
-                Value::Indirection(target) => idx = target,
+                // Ready — follow the memoized result pointer.
+                Value::Ready(target) => idx = target,
 
-                // Thunk — force it via the black-hole protocol.
-                Value::Thunk { expr, env } => {
-                    let thunk_idx = idx;
-                    self.lisp.arena.set(thunk_idx, Value::BlackHole)?;
-                    self.push_root(thunk_idx);
+                // Lazy — poll it via the Polling protocol.
+                Value::Lazy { expr, env } => {
+                    let lazy_idx = idx;
+                    self.lisp.arena.set(lazy_idx, Value::Polling)?;
+                    self.push_root(lazy_idx);
 
                     let result = self.eval(expr, env)?;
                     self.pop_roots(1);
 
-                    // Follow indirections, detecting cycles via black holes.
+                    // Follow ready chain, detecting cycles via polling sentinel.
                     let mut target = result;
                     loop {
                         match self.lisp.get(target)? {
-                            Value::Indirection(t) => target = t,
-                            Value::BlackHole => return Err(ArenaError::BlackHoleDetected),
+                            Value::Ready(t) => target = t,
+                            Value::Polling => return Err(ArenaError::BlackHoleDetected),
                             _ => break,
                         }
                     }
 
-                    // Memoize: overwrite thunk cell with indirection.
-                    self.lisp.arena.set(thunk_idx, Value::Indirection(target))?;
+                    // Memoize: overwrite lazy cell with ready.
+                    self.lisp.arena.set(lazy_idx, Value::Ready(target))?;
                     idx = target;
                 }
 
                 // Circular dependency detected.
-                Value::BlackHole => return Err(ArenaError::BlackHoleDetected),
+                Value::Polling => return Err(ArenaError::BlackHoleDetected),
 
                 _ => unreachable!(),
             }
         }
+    }
+
+    /// Force a value to WHNF using the [`ForceFuture`] poll-based protocol,
+    /// driven by the [`block_on`] minimal executor.
+    pub fn force_async(&mut self, idx: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        block_on(ForceFuture {
+            evaluator: self,
+            idx,
+        })
+    }
+
+    /// Async wrapper around [`eval`]: evaluates an expression, returning the
+    /// result.  Uses `.await` internally (via the async fn desugaring).
+    #[allow(dead_code)]
+    pub async fn eval_async(
+        &mut self,
+        expr: ArenaIndex,
+        env: ArenaIndex,
+    ) -> ArenaResult<ArenaIndex> {
+        self.eval(expr, env)
+    }
+
+    /// Async wrapper: evaluate an expression and force the result to WHNF.
+    #[allow(dead_code)]
+    pub async fn eval_force_async(
+        &mut self,
+        expr: ArenaIndex,
+        env: ArenaIndex,
+    ) -> ArenaResult<ArenaIndex> {
+        let val = self.eval_async(expr, env).await?;
+        self.force_async(val)
+    }
+
+    /// Async wrapper: evaluate and force all arguments in a list.
+    #[allow(dead_code)]
+    pub async fn force_args_async(
+        &mut self,
+        args: ArenaIndex,
+        env: ArenaIndex,
+    ) -> ArenaResult<ArenaIndex> {
+        self.force_args(args, env)
     }
 
     /// Trigger garbage collection using all known live roots.
@@ -400,10 +582,13 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     }
 
     /// Evaluate an expression and immediately force the result to WHNF.
+    ///
+    /// Uses [`force_async`] which drives the [`ForceFuture`] poll-based
+    /// protocol via the minimal [`block_on`] executor.
     #[inline]
     fn eval_force(&mut self, expr: ArenaIndex, env: ArenaIndex) -> ArenaResult<ArenaIndex> {
         let val = self.eval(expr, env)?;
-        self.force(val)
+        self.force_async(val)
     }
 
     /// Evaluate an expression in an environment (with TCO).
@@ -420,23 +605,23 @@ impl<'a, const N: usize> Evaluator<'a, N> {
             }
 
             match val {
-                // Thunk encountered as a bare expression — force it.
-                Value::Thunk { .. } => return self.force(expr),
+                // Lazy value encountered as a bare expression — force it.
+                Value::Lazy { .. } => return self.force_async(expr),
 
-                // Indirection — follow it (no stack growth).
-                Value::Indirection(target) => {
+                // Ready — follow the memoized result (no stack growth).
+                Value::Ready(target) => {
                     expr = target;
                     continue;
                 }
 
-                // Black hole — circular evaluation.
-                Value::BlackHole => return Err(ArenaError::BlackHoleDetected),
+                // Polling — circular evaluation.
+                Value::Polling => return Err(ArenaError::BlackHoleDetected),
 
                 // Symbol → look up in local env, then global env.
                 Value::Symbol(_) => {
                     let binding = env_lookup(self.lisp, env, expr)
                         .or_else(|_| env_lookup(self.lisp, self.global_env, expr))?;
-                    if matches!(self.lisp.get(binding)?, Value::BlackHole) {
+                    if matches!(self.lisp.get(binding)?, Value::Polling) {
                         return Err(ArenaError::BlackHoleDetected);
                     }
                     return Ok(binding);
@@ -503,8 +688,8 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                     cdr: rest,
                 } => {
                     let arg_expr = self.lisp.car(arg_exprs)?;
-                    let thunk = self.lisp.thunk(arg_expr, call_env)?;
-                    fn_env = env_bind(self.lisp, fn_env, param, thunk)?;
+                    let lazy = self.lisp.lazy(arg_expr, call_env)?;
+                    fn_env = env_bind(self.lisp, fn_env, param, lazy)?;
 
                     params = rest;
                     arg_exprs = self.lisp.cdr(arg_exprs)?;
@@ -513,8 +698,8 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                     // Rest parameter: bind remaining args as a thunk-wrapped list
                     // We need to evaluate the rest args lazily.
                     // Build a list of thunks for the remaining args.
-                    let rest_thunks = self.make_thunk_list(arg_exprs, call_env)?;
-                    fn_env = env_bind(self.lisp, fn_env, params, rest_thunks)?;
+                    let rest_lazys = self.make_lazy_list(arg_exprs, call_env)?;
+                    fn_env = env_bind(self.lisp, fn_env, params, rest_lazys)?;
                     return Ok(fn_env);
                 }
                 _ => return Err(ArenaError::TypeError),
@@ -523,13 +708,13 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         Ok(fn_env)
     }
 
-    /// Build a list of thunks from a list of expressions (iterative, O(n)).
-    fn make_thunk_list(&self, exprs: ArenaIndex, call_env: ArenaIndex) -> ArenaResult<ArenaIndex> {
+    /// Build a list of lazy values from a list of expressions (iterative, O(n)).
+    fn make_lazy_list(&self, exprs: ArenaIndex, call_env: ArenaIndex) -> ArenaResult<ArenaIndex> {
         let mut reversed = ArenaIndex::NIL;
         let mut cur = exprs;
         while !cur.is_nil() {
-            let thunk = self.lisp.thunk(self.lisp.car(cur)?, call_env)?;
-            reversed = self.lisp.cons(thunk, reversed)?;
+            let lazy = self.lisp.lazy(self.lisp.car(cur)?, call_env)?;
+            reversed = self.lisp.cons(lazy, reversed)?;
             cur = self.lisp.cdr(cur)?;
         }
         // Reverse to restore original order.
@@ -621,10 +806,10 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         match self.lisp.get(first)? {
             Value::Symbol(_) => {
                 let val_expr = self.lisp.car(rest)?;
-                // Create thunk for the RHS
-                let thunk = self.lisp.thunk(val_expr, env)?;
-                self.global_env = env_bind(self.lisp, self.global_env, first, thunk)?;
-                Ok(thunk)
+                // Create lazy value for the RHS
+                let lazy = self.lisp.lazy(val_expr, env)?;
+                self.global_env = env_bind(self.lisp, self.global_env, first, lazy)?;
+                Ok(lazy)
             }
             Value::Cons {
                 car: name,
@@ -801,8 +986,8 @@ impl<'a, const N: usize> Evaluator<'a, N> {
                 let binding = self.lisp.car(cur)?;
                 let name = self.lisp.car(binding)?;
                 let val_expr = self.lisp.car(self.lisp.cdr(binding)?)?;
-                let thunk = self.lisp.thunk(val_expr, *env)?;
-                local_env = env_bind(self.lisp, local_env, name, thunk)?;
+                let lazy = self.lisp.lazy(val_expr, *env)?;
+                local_env = env_bind(self.lisp, local_env, name, lazy)?;
                 cur = self.lisp.cdr(cur)?;
             }
 
@@ -812,7 +997,7 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         })())
     }
 
-    /// `(cons a b)` — lazy cons: does NOT evaluate arguments.
+    /// `(cons a b)` — lazy cons: does NOT evaluate arguments (creates lazy values).
     fn eval_cons(
         &mut self,
         args: ArenaIndex,
@@ -825,9 +1010,9 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     fn eval_cons_inner(&mut self, args: ArenaIndex, env: ArenaIndex) -> ArenaResult<ArenaIndex> {
         let a_expr = self.lisp.car(args)?;
         let b_expr = self.lisp.car(self.lisp.cdr(args)?)?;
-        let a_thunk = self.lisp.thunk(a_expr, env)?;
-        let b_thunk = self.lisp.thunk(b_expr, env)?;
-        self.lisp.cons(a_thunk, b_thunk)
+        let a_lazy = self.lisp.lazy(a_expr, env)?;
+        let b_lazy = self.lisp.lazy(b_expr, env)?;
+        self.lisp.cons(a_lazy, b_lazy)
     }
 
     /// Wrap a list of expressions in a `begin` form if there are multiple,

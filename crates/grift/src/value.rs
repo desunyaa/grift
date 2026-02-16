@@ -39,16 +39,16 @@ pub enum Value {
     },
     /// A built-in function identified by index.
     Builtin(BuiltinId),
-    /// An unevaluated expression paired with the environment in which
-    /// it should be evaluated when forced.
-    Thunk {
+    /// A lazy (not-yet-polled) future: unevaluated expression paired
+    /// with the environment in which it should be evaluated when forced.
+    Lazy {
         expr: ArenaIndex,
         env: ArenaIndex,
     },
-    /// A thunk that is currently being forced (cycle detection).
-    BlackHole,
-    /// A forced thunk pointing to its evaluated result.
-    Indirection(ArenaIndex),
+    /// A future currently being polled (cycle detection sentinel).
+    Polling,
+    /// A resolved future pointing to its memoized result.
+    Ready(ArenaIndex),
 }
 
 /// Generate a `Value` accessor that pattern-matches on a variant and
@@ -79,9 +79,9 @@ impl Value {
             Value::Char(_) => "char",
             Value::Lambda { .. } => "lambda",
             Value::Builtin(_) => "builtin",
-            Value::Thunk { .. } => "thunk",
-            Value::BlackHole => "black-hole",
-            Value::Indirection(_) => "indirection",
+            Value::Lazy { .. } => "lazy",
+            Value::Polling => "polling",
+            Value::Ready(_) => "ready",
         }
     }
 
@@ -93,7 +93,7 @@ impl Value {
     pub fn is_whnf(self) -> bool {
         !matches!(
             self,
-            Value::Thunk { .. } | Value::BlackHole | Value::Indirection(_)
+            Value::Lazy { .. } | Value::Polling | Value::Ready(_)
         )
     }
 
@@ -150,9 +150,9 @@ impl core::fmt::Display for Value {
             Value::String { .. } => f.write_str("<string>"),
             Value::Lambda { .. } => f.write_str("<lambda>"),
             Value::Builtin(_) => f.write_str("<builtin>"),
-            Value::Thunk { .. } => f.write_str("<thunk>"),
-            Value::BlackHole => f.write_str("<black-hole>"),
-            Value::Indirection(_) => f.write_str("<indirection>"),
+            Value::Lazy { .. } => f.write_str("<lazy>"),
+            Value::Polling => f.write_str("<polling>"),
+            Value::Ready(_) => f.write_str("<ready>"),
         }
     }
 }
