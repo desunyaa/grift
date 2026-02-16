@@ -49,7 +49,7 @@ fn noop_raw_waker() -> RawWaker {
 /// The raw waker infrastructure ([`noop_raw_waker`], [`NOOP_VTABLE`])
 /// is available for platforms where `Waker::noop()` is not supported.
 fn block_on<F: Future + Unpin>(mut future: F) -> F::Output {
-    // Reference the raw waker infrastructure to document its availability.
+    // Ensure the RawWaker/RawWakerVTable infrastructure is referenced.
     let _raw_waker: fn() -> RawWaker = noop_raw_waker;
     let waker: &Waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
@@ -525,7 +525,9 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     }
 
     /// Async wrapper around [`eval`]: evaluates an expression, returning the
-    /// result.  Uses `.await` internally (via the async fn desugaring).
+    /// result.  This is a thin async fn that delegates to the synchronous
+    /// `eval` method, providing an `.await`-compatible interface for callers
+    /// that compose multiple async evaluation steps (e.g., `eval_force_async`).
     #[allow(dead_code)]
     pub async fn eval_async(
         &mut self,
@@ -547,6 +549,8 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     }
 
     /// Async wrapper: evaluate and force all arguments in a list.
+    /// Provides an `.await`-compatible interface for composing with other
+    /// async evaluation functions.
     #[allow(dead_code)]
     pub async fn force_args_async(
         &mut self,
