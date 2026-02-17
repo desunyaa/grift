@@ -1248,6 +1248,14 @@ fn test_environment_predicate() {
 }
 
 #[test]
+fn test_ignore_predicate() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(ignore?)"), Ok(Value::Boolean(true)));
+    assert_eq!(lisp.eval("(ignore? #ignore #ignore)"), Ok(Value::Boolean(true)));
+    assert_eq!(lisp.eval("(ignore? #ignore 42)"), Ok(Value::Boolean(false)));
+}
+
+#[test]
 fn test_make_environment_no_parent() {
     let lisp: Lisp<20000> = Lisp::new();
     assert_eq!(
@@ -1476,6 +1484,32 @@ fn test_make_environment_with_parent() {
         ),
         Ok(Value::Number(99))
     );
+}
+
+#[test]
+fn test_make_environment_with_multiple_parents_ordered_lookup() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(
+        lisp.eval(
+            r#"
+            (begin
+                (define! get-env (vau () e e))
+                (define! first (make-environment (get-env)))
+                (define! second (make-environment (get-env)))
+                (eval '(define! x 1) first)
+                (eval '(define! x 2) second)
+                (define! child (make-environment first second))
+                (eval 'x child))
+            "#
+        ),
+        Ok(Value::Number(1))
+    );
+}
+
+#[test]
+fn test_make_environment_rejects_non_environment_parent() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(make-environment 42)"), Err(ArenaError::TypeError));
 }
 
 #[test]
@@ -1755,6 +1789,15 @@ fn test_define_ptree_pair_mismatch() {
     // Pair definiend with non-pair value should error
     let lisp: Lisp<20000> = Lisp::new();
     assert!(lisp.eval("(define! (a . b) 42)").is_err());
+}
+
+#[test]
+fn test_define_ptree_duplicate_symbol_rejected() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(
+        lisp.eval("(define! (a . a) (cons 1 2))"),
+        Err(ArenaError::InvalidArgument)
+    );
 }
 
 #[test]

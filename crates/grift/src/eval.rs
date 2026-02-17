@@ -195,6 +195,7 @@ define_builtins! {
         "symbol?" => bi_symbolp => builtin_symbolp,
         "boolean?" => bi_booleanp => builtin_booleanp,
         "inert?"  => bi_inertp  => builtin_inertp,
+        "ignore?" => bi_ignorep => builtin_ignorep,
         "eq?"    => bi_eqp    => builtin_eqp,
         "equal?" => bi_equalp => builtin_equalp,
         "eval"   => bi_eval   => builtin_eval,
@@ -541,6 +542,7 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     ) -> TailAction {
         TailAction::non_tail((|| {
             let definiend = self.lisp.car(args)?;
+            self.validate_ptree(definiend)?;
             let val_expr = self.lisp.cadr(args)?;
             let val = self.eval(val_expr, *env)?;
             self.match_ptree(definiend, val, *env)?;
@@ -741,17 +743,65 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     /// - Nil (the empty list).
     /// - A pair whose car and cdr are both valid ptrees.
     fn validate_ptree(&self, ptree: ArenaIndex) -> ArenaResult<()> {
+        let mut path_pairs = [ArenaIndex::NIL; N];
+        let mut path_len = 0usize;
+        let mut symbols = [ArenaIndex::NIL; N];
+        let mut symbol_len = 0usize;
+        self.validate_ptree_inner(
+            ptree,
+            &mut path_pairs,
+            &mut path_len,
+            &mut symbols,
+            &mut symbol_len,
+        )
+    }
+
+    fn validate_ptree_inner(
+        &self,
+        ptree: ArenaIndex,
+        path_pairs: &mut [ArenaIndex; N],
+        path_len: &mut usize,
+        symbols: &mut [ArenaIndex; N],
+        symbol_len: &mut usize,
+    ) -> ArenaResult<()> {
         if ptree.is_nil() {
             return Ok(());
         }
         match self.lisp.get(ptree)? {
-            Value::Symbol(_) => Ok(()),
+            Value::Symbol(_) => {
+                if self.lisp.symbol_name_eq(ptree, "#ignore") {
+                    return Ok(());
+                }
+                for &seen in symbols.iter().take(*symbol_len) {
+                    if seen == ptree {
+                        return Err(ArenaError::InvalidArgument);
+                    }
+                }
+                if *symbol_len == N {
+                    return Err(ArenaError::InvalidArgument);
+                }
+                symbols[*symbol_len] = ptree;
+                *symbol_len += 1;
+                Ok(())
+            }
             Value::Cons {
                 car: ptree_car,
                 cdr: ptree_cdr,
             } => {
-                self.validate_ptree(ptree_car)?;
-                self.validate_ptree(ptree_cdr)
+                for &seen in path_pairs.iter().take(*path_len) {
+                    if seen == ptree {
+                        return Err(ArenaError::InvalidArgument);
+                    }
+                }
+                if *path_len == N {
+                    return Err(ArenaError::InvalidArgument);
+                }
+                path_pairs[*path_len] = ptree;
+                *path_len += 1;
+                self.validate_ptree_inner(ptree_car, path_pairs, path_len, symbols, symbol_len)?;
+                self.validate_ptree_inner(ptree_cdr, path_pairs, path_len, symbols, symbol_len)?;
+                *path_len -= 1;
+                Ok(())
             }
             _ => Err(ArenaError::TypeError),
         }
@@ -874,6 +924,17 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     type_predicate!(builtin_symbolp, Value::Symbol(_));
     type_predicate!(builtin_booleanp, Value::Boolean(_));
     type_predicate!(builtin_inertp, Value::Inert);
+    fn builtin_ignorep(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let mut cur = args;
+        while !cur.is_nil() {
+            let val = self.lisp.car(cur)?;
+            if !self.lisp.symbol_name_eq(val, "#ignore") {
+                return self.lisp.boolean(false);
+            }
+            cur = self.lisp.cdr(cur)?;
+        }
+        self.lisp.boolean(true)
+    }
 
     /// `(not boolean)` — boolean negation (requires exactly one boolean arg).
     fn builtin_not(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
@@ -995,14 +1056,17 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     );
     type_predicate!(builtin_applicativep, Value::Applicative(_));
 
-    /// `(make-environment [parent])`.
+    /// `(make-environment . environments)`.
     fn builtin_make_env(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
-        let parent = if args.is_nil() {
-            ArenaIndex::NIL
-        } else {
-            self.lisp.car(args)?
-        };
-        self.lisp.make_child_env(parent)
+        let mut cur = args;
+        while !cur.is_nil() {
+            let parent = self.lisp.car(cur)?;
+            if !matches!(self.lisp.get(parent)?, Value::Environment { .. }) {
+                return Err(ArenaError::TypeError);
+            }
+            cur = self.lisp.cdr(cur)?;
+        }
+        self.lisp.make_env(args)
     }
 
     /// `(make-empty-environment)` — always creates a parentless environment.

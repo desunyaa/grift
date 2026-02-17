@@ -214,14 +214,24 @@ impl<const N: usize> Lisp<N> {
 
     /// Create a root (top-level) environment with no parent.
     pub(crate) fn make_root_env(&self) -> ArenaResult<ArenaIndex> {
-        self.make_child_env(ArenaIndex::NIL)
+        self.make_env(ArenaIndex::NIL)
     }
 
     /// Create a child environment with the given parent.
     pub(crate) fn make_child_env(&self, parent: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let parents = if parent.is_nil() {
+            ArenaIndex::NIL
+        } else {
+            self.cons(parent, ArenaIndex::NIL)?
+        };
+        self.make_env(parents)
+    }
+
+    /// Create an environment with explicit parent list.
+    pub(crate) fn make_env(&self, parents: ArenaIndex) -> ArenaResult<ArenaIndex> {
         self.arena.alloc(Value::Environment {
             bindings: ArenaIndex::NIL,
-            parent,
+            parent: parents,
         })
     }
 
@@ -252,21 +262,59 @@ impl<const N: usize> Lisp<N> {
         env: ArenaIndex,
         name: ArenaIndex,
     ) -> ArenaResult<ArenaIndex> {
-        let mut cur_env = env;
-        while !cur_env.is_nil() {
-            let Value::Environment { bindings, parent } = self.arena.get(cur_env)? else {
-                return Err(ArenaError::TypeError);
-            };
-            // Search bindings alist in this frame
-            let mut cur = bindings;
-            while !cur.is_nil() {
-                let binding = self.car(cur)?;
-                if self.car(binding)? == name {
-                    return self.cdr(binding);
-                }
-                cur = self.cdr(cur)?;
+        let mut visited = [ArenaIndex::NIL; N];
+        let mut visited_len = 0usize;
+        self.env_lookup_with_visited(env, name, &mut visited, &mut visited_len)
+    }
+
+    fn env_lookup_with_visited(
+        &self,
+        env: ArenaIndex,
+        name: ArenaIndex,
+        visited: &mut [ArenaIndex; N],
+        visited_len: &mut usize,
+    ) -> ArenaResult<ArenaIndex> {
+        if env.is_nil() {
+            return Err(ArenaError::UnboundVariable);
+        }
+        for &seen in visited.iter().take(*visited_len) {
+            if seen == env {
+                return Err(ArenaError::UnboundVariable);
             }
-            cur_env = parent;
+        }
+        if *visited_len == N {
+            return Err(ArenaError::UnboundVariable);
+        }
+        visited[*visited_len] = env;
+        *visited_len += 1;
+
+        let Value::Environment { bindings, parent } = self.arena.get(env)? else {
+            return Err(ArenaError::TypeError);
+        };
+        let mut cur = bindings;
+        while !cur.is_nil() {
+            let binding = self.car(cur)?;
+            if self.car(binding)? == name {
+                return self.cdr(binding);
+            }
+            cur = self.cdr(cur)?;
+        }
+
+        if parent.is_nil() {
+            return Err(ArenaError::UnboundVariable);
+        }
+        if matches!(self.arena.get(parent)?, Value::Environment { .. }) {
+            return self.env_lookup_with_visited(parent, name, visited, visited_len);
+        }
+        let mut parents = parent;
+        while !parents.is_nil() {
+            let parent_env = self.car(parents)?;
+            match self.env_lookup_with_visited(parent_env, name, visited, visited_len) {
+                Ok(v) => return Ok(v),
+                Err(ArenaError::UnboundVariable) => {}
+                Err(e) => return Err(e),
+            }
+            parents = self.cdr(parents)?;
         }
         Err(ArenaError::UnboundVariable)
     }
