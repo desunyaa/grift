@@ -1508,6 +1508,24 @@ fn test_child_env_inherits_from_parent() {
     );
 }
 
+#[test]
+fn test_environment_lookup_walks_multiple_parent_levels() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(
+        lisp.eval(
+            r#"
+            (begin
+                (define! get-env (vau () e e))
+                (define! root (get-env))
+                (define! level1 (make-environment root))
+                (define! level2 (make-environment level1))
+                (eval '(+ 40 2) level2))
+            "#
+        ),
+        Ok(Value::Number(42))
+    );
+}
+
 // ============================================================================
 // Sandboxed / Restricted Environment Tests
 // ============================================================================

@@ -260,11 +260,20 @@ impl<const N: usize> Lisp<N> {
             // Search bindings alist in this frame
             let mut cur = bindings;
             while !cur.is_nil() {
-                let binding = self.car(cur)?;
-                if self.car(binding)? == name {
-                    return self.cdr(binding);
+                let Value::Cons { car: binding, cdr: next } = self.arena.get(cur)? else {
+                    return Err(ArenaError::TypeError);
+                };
+                let Value::Cons {
+                    car: bound_name,
+                    cdr: bound_value,
+                } = self.arena.get(binding)?
+                else {
+                    return Err(ArenaError::TypeError);
+                };
+                if bound_name == name {
+                    return Ok(bound_value);
                 }
-                cur = self.cdr(cur)?;
+                cur = next;
             }
             cur_env = parent;
         }
