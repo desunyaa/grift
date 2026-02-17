@@ -71,6 +71,30 @@ fn test_numeric_equality() {
 }
 
 #[test]
+fn test_eq_predicate() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(eq? #t #t)"), Ok(Value::Boolean(true)));
+    assert_eq!(lisp.eval("(eq? #t #f)"), Ok(Value::Boolean(false)));
+    assert_eq!(
+        lisp.eval("(begin (define! p (cons 1 2)) (eq? p p))"),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(lisp.eval("(eq? (cons 1 2) (cons 1 2))"), Ok(Value::Boolean(false)));
+}
+
+#[test]
+fn test_equal_predicate() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(equal? #t #t)"), Ok(Value::Boolean(true)));
+    assert_eq!(lisp.eval("(equal? #t #f)"), Ok(Value::Boolean(false)));
+    assert_eq!(lisp.eval("(equal? (cons 1 2) (cons 1 2))"), Ok(Value::Boolean(true)));
+    assert_eq!(
+        lisp.eval("(equal? (list 1 2 3) (cons 1 (cons 2 (cons 3 '()))))"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn test_less_than() {
     let lisp: Lisp<20000> = Lisp::new();
     assert_eq!(lisp.eval("(< 1 2)"), Ok(Value::Boolean(true)));
@@ -227,6 +251,13 @@ fn test_boolean_predicate() {
     let lisp: Lisp<20000> = Lisp::new();
     assert_eq!(lisp.eval("(boolean? #t)"), Ok(Value::Boolean(true)));
     assert_eq!(lisp.eval("(boolean? 1)"), Ok(Value::Boolean(false)));
+}
+
+#[test]
+fn test_inert_predicate() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(inert? #inert)"), Ok(Value::Boolean(true)));
+    assert_eq!(lisp.eval("(inert? 1)"), Ok(Value::Boolean(false)));
 }
 
 // ============================================================================

@@ -187,6 +187,9 @@ define_builtins! {
         "number?" => bi_numberp => builtin_numberp,
         "symbol?" => bi_symbolp => builtin_symbolp,
         "boolean?" => bi_booleanp => builtin_booleanp,
+        "inert?" => bi_inertp => builtin_inertp,
+        "eq?" => bi_eqp => builtin_eqp,
+        "equal?" => bi_equalp => builtin_equalp,
         "eval"   => bi_eval   => builtin_eval,
         "wrap"   => bi_wrap   => builtin_wrap,
         "unwrap" => bi_unwrap => builtin_unwrap,
@@ -864,6 +867,49 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     type_predicate!(builtin_numberp, Value::Number(_));
     type_predicate!(builtin_symbolp, Value::Symbol(_));
     type_predicate!(builtin_booleanp, Value::Boolean(_));
+    type_predicate!(builtin_inertp, Value::Inert);
+
+    fn builtin_eqp(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let a = self.lisp.car(args)?;
+        let b = self.lisp.cadr(args)?;
+        self.lisp.boolean(self.eqp(a, b)?)
+    }
+
+    fn builtin_equalp(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let a = self.lisp.car(args)?;
+        let b = self.lisp.cadr(args)?;
+        self.lisp.boolean(self.equalp(a, b)?)
+    }
+
+    fn eqp(&self, a: ArenaIndex, b: ArenaIndex) -> ArenaResult<bool> {
+        if a == b {
+            return Ok(true);
+        }
+        let av = self.lisp.get(a)?;
+        let bv = self.lisp.get(b)?;
+        Ok(match (av, bv) {
+            (Value::Nil, Value::Nil)
+            | (Value::Inert, Value::Inert)
+            | (Value::Boolean(_), Value::Boolean(_))
+            | (Value::Number(_), Value::Number(_))
+            | (Value::Char(_), Value::Char(_)) => av == bv,
+            _ => false,
+        })
+    }
+
+    fn equalp(&self, a: ArenaIndex, b: ArenaIndex) -> ArenaResult<bool> {
+        if self.eqp(a, b)? {
+            return Ok(true);
+        }
+        let av = self.lisp.get(a)?;
+        let bv = self.lisp.get(b)?;
+        match (av, bv) {
+            (Value::Cons { car: acar, cdr: acdr }, Value::Cons { car: bcar, cdr: bcdr }) => {
+                Ok(self.equalp(acar, bcar)? && self.equalp(acdr, bcdr)?)
+            }
+            _ => Ok(false),
+        }
+    }
 
     // — Kernel combiners —
 
