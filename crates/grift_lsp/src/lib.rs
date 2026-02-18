@@ -14,316 +14,34 @@ use serde::{Deserialize, Serialize};
 
 // ── Builtin documentation database ──────────────────────────────────────────
 
-/// Documentation entry for a builtin or keyword.
+/// Documentation entry for a builtin or keyword (LSP layer).
 pub struct DocEntry {
     pub signature: &'static str,
     pub description: &'static str,
     pub kind: CompletionItemKind,
 }
 
-/// Build the documentation database from LANGUAGE.md content.
+/// Build the LSP documentation database from the shared `grift_check::docs`
+/// database. Maps `DocKind` to LSP `CompletionItemKind`.
 pub fn builtin_docs() -> HashMap<&'static str, DocEntry> {
-    let mut m = HashMap::new();
-
-    // Operatives (keywords)
-    m.insert(
-        "quote",
-        DocEntry {
-            signature: "(quote expr)",
-            description: "Return expr without evaluating it.",
-            kind: CompletionItemKind::Keyword,
-        },
-    );
-    m.insert("if", DocEntry {
-        signature: "(if test consequent [alternative])",
-        description: "Evaluate test. If #t, evaluate consequent; if #f, evaluate alternative (or return () if omitted). test must be a boolean.",
-        kind: CompletionItemKind::Keyword,
-    });
-    m.insert("define!", DocEntry {
-        signature: "(define! definiend expression)",
-        description: "Evaluate expression, then match definiend (a parameter tree) against the result, binding symbols in the current environment. Returns #inert.",
-        kind: CompletionItemKind::Keyword,
-    });
-    m.insert("set!", DocEntry {
-        signature: "(set! env-expr definiend expression)",
-        description: "Evaluate env-expr to get a target environment and expression to get a value, then bind definiend in the target environment. Returns #inert.",
-        kind: CompletionItemKind::Keyword,
-    });
-    m.insert("lambda", DocEntry {
-        signature: "(lambda params body ...)",
-        description: "Create an applicative (arguments are evaluated before binding). Equivalent to (wrap (vau params #ignore (begin body ...))).",
-        kind: CompletionItemKind::Keyword,
-    });
-    m.insert("vau", DocEntry {
-        signature: "(vau params env-param body ...)",
-        description: "Create an operative (fexpr). params is matched against unevaluated operands. env-param is bound to the caller's environment (or #ignore).",
-        kind: CompletionItemKind::Keyword,
-    });
-    m.insert("begin", DocEntry {
-        signature: "(begin expr1 expr2 ... exprN)",
-        description: "Evaluate each expression in order. Returns the value of the last expression, or () if given no expressions.",
-        kind: CompletionItemKind::Keyword,
-    });
-    m.insert("cond", DocEntry {
-        signature: "(cond (test1 body1 ...) ... (else bodyN ...))",
-        description: "Evaluate tests in order until one returns #t (or else clause), then evaluate the corresponding body. Returns () if no clause matches.",
-        kind: CompletionItemKind::Keyword,
-    });
-    m.insert("and", DocEntry {
-        signature: "(and expr1 expr2 ... exprN)",
-        description: "Evaluate left-to-right. If any evaluates to #f, return #f immediately. Otherwise return the last result. With no arguments, returns #t.",
-        kind: CompletionItemKind::Keyword,
-    });
-    m.insert("or", DocEntry {
-        signature: "(or expr1 expr2 ... exprN)",
-        description: "Evaluate left-to-right. If any evaluates to #t, return #t immediately. Otherwise return the last result. With no arguments, returns #f.",
-        kind: CompletionItemKind::Keyword,
-    });
-    m.insert("let", DocEntry {
-        signature: "(let ((name1 val1) (name2 val2) ...) body ...)",
-        description: "Create a child environment, evaluate each val in the outer environment, bind names in the child, then evaluate body in the child.",
-        kind: CompletionItemKind::Keyword,
-    });
-
-    // Applicatives (functions)
-    m.insert(
-        "cons",
-        DocEntry {
-            signature: "(cons a b)",
-            description: "Construct a pair.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "+",
-        DocEntry {
-            signature: "(+ . numbers)",
-            description: "Sum. Zero arguments returns 0.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "-",
-        DocEntry {
-            signature: "(- n . rest)",
-            description: "With one argument: negate. With two+: left fold subtraction.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "*",
-        DocEntry {
-            signature: "(* . numbers)",
-            description: "Product. Zero arguments returns 1.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "/",
-        DocEntry {
-            signature: "(/ a b)",
-            description: "Integer (truncating) division. DivisionByZero if b is 0.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "=",
-        DocEntry {
-            signature: "(= a b)",
-            description: "Numeric equality. Both arguments must be numbers.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "<",
-        DocEntry {
-            signature: "(< a b)",
-            description: "Less than. Both arguments must be numbers.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        ">",
-        DocEntry {
-            signature: "(> a b)",
-            description: "Greater than. Both arguments must be numbers.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "<=",
-        DocEntry {
-            signature: "(<= a b)",
-            description: "Less than or equal. Both arguments must be numbers.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        ">=",
-        DocEntry {
-            signature: "(>= a b)",
-            description: "Greater than or equal. Both arguments must be numbers.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "car",
-        DocEntry {
-            signature: "(car pair)",
-            description: "First element of a pair.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "cdr",
-        DocEntry {
-            signature: "(cdr pair)",
-            description: "Second element of a pair.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "list",
-        DocEntry {
-            signature: "(list . items)",
-            description: "Return the argument list as-is (already a proper list).",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "null?",
-        DocEntry {
-            signature: "(null? . objects)",
-            description: "Returns #t if all arguments are ().",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "not",
-        DocEntry {
-            signature: "(not boolean)",
-            description: "Boolean negation. Argument must be a boolean.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "pair?",
-        DocEntry {
-            signature: "(pair? . objects)",
-            description: "Returns #t if all arguments are pairs.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "number?",
-        DocEntry {
-            signature: "(number? . objects)",
-            description: "Returns #t if all arguments are numbers.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "symbol?",
-        DocEntry {
-            signature: "(symbol? . objects)",
-            description: "Returns #t if all arguments are symbols.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "boolean?",
-        DocEntry {
-            signature: "(boolean? . objects)",
-            description: "Returns #t if all arguments are booleans.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "inert?",
-        DocEntry {
-            signature: "(inert? . objects)",
-            description: "Returns #t if all arguments are #inert.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "ignore?",
-        DocEntry {
-            signature: "(ignore? . objects)",
-            description: "Returns #t if all arguments are #ignore.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert("eq?", DocEntry {
-        signature: "(eq? a b)",
-        description: "Identity equality. Compares by value for scalars, by arena identity for constructed types.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("equal?", DocEntry {
-        signature: "(equal? a b)",
-        description: "Structural equality. Returns #t whenever eq? would, plus compares pairs recursively and strings character-by-character.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("eval", DocEntry {
-        signature: "(eval expr [env])",
-        description: "Evaluate expr in the given environment (defaults to the standard environment if omitted).",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert(
-        "wrap",
-        DocEntry {
-            signature: "(wrap combiner)",
-            description: "Wrap a combiner in an applicative (arguments will be evaluated).",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "unwrap",
-        DocEntry {
-            signature: "(unwrap applicative)",
-            description: "Extract the underlying combiner from an applicative.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "operative?",
-        DocEntry {
-            signature: "(operative? . objects)",
-            description: "Returns #t if all arguments are operatives or builtins.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "applicative?",
-        DocEntry {
-            signature: "(applicative? . objects)",
-            description: "Returns #t if all arguments are applicatives.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert("make-environment", DocEntry {
-        signature: "(make-environment . envs)",
-        description: "Create a new environment with the given parents. All arguments must be environments.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert(
-        "make-empty-environment",
-        DocEntry {
-            signature: "(make-empty-environment)",
-            description: "Create a new environment with no parents.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-    m.insert(
-        "environment?",
-        DocEntry {
-            signature: "(environment? . objects)",
-            description: "Returns #t if all arguments are environments.",
-            kind: CompletionItemKind::Function,
-        },
-    );
-
-    m
+    use grift_check::docs::DocKind;
+    grift_check::docs::builtin_docs()
+        .into_iter()
+        .map(|(name, entry)| {
+            let kind = match entry.kind {
+                DocKind::Operative => CompletionItemKind::Keyword,
+                DocKind::Applicative => CompletionItemKind::Function,
+            };
+            (
+                name,
+                DocEntry {
+                    signature: entry.signature,
+                    description: entry.description,
+                    kind,
+                },
+            )
+        })
+        .collect()
 }
 
 // ── LSP JSON-RPC types ──────────────────────────────────────────────────────
@@ -465,7 +183,7 @@ pub struct CompletionParams {
     pub position: Position,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CompletionItemKind(u32);
 
 #[allow(dead_code, non_upper_case_globals)]

@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-02-18 (3)
+
+### Improved — Integrate grift_check and grift_lsp into the REPL
+
+- **Shared documentation database**: Moved the builtin docs (signatures,
+  descriptions, kind) from `grift_lsp` into `grift_check::docs`, making
+  them the single source of truth for both the REPL and the LSP server.
+  This eliminates the 200-line hardcoded `print_doc()` match in main.rs
+  and the duplicated docs in `grift_lsp/src/lib.rs`.
+
+- **REPL uses `grift_check` before eval**: Every expression entered in the
+  REPL now runs through `grift_check::check()` before being evaluated.
+  Structural errors (unmatched parens, unterminated strings) are reported
+  with accurate line/column positions and the expression is not evaluated.
+  Arity warnings are printed but evaluation still proceeds.
+
+- **REPL `,doc` and `,builtins` use shared docs**: These commands now use
+  `grift_check::docs::builtin_docs()` instead of hardcoded match arms.
+  Adding a new builtin to the database automatically updates all three
+  consumers: REPL, LSP, and static checker.
+
+- **`grift lsp` subcommand**: Added a `grift lsp` CLI command that execs
+  the `grift-lsp` binary (first from the same directory as the `grift`
+  binary, then from PATH). This gives users a single entry point.
+
 ## 2026-02-18 (2)
 
 ### Improved — LSP and Static Checking

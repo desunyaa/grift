@@ -1,4 +1,5 @@
 use grift::Lisp;
+use grift_check::docs::{DocEntry, DocKind, builtin_docs};
 use rustyline::DefaultEditor;
 
 const PROMPT: &str = "Λ> ";
@@ -19,7 +20,11 @@ fn print_banner() {
     println!();
 }
 
-fn handle_meta_command(cmd: &str, lisp: &Lisp<ARENA_SIZE>) -> bool {
+fn handle_meta_command(
+    cmd: &str,
+    lisp: &Lisp<ARENA_SIZE>,
+    docs: &[(&'static str, DocEntry)],
+) -> bool {
     let (command, arg) = match cmd.find(' ') {
         Some(pos) => (&cmd[..pos], cmd[pos + 1..].trim()),
         None => (cmd, ""),
@@ -27,8 +32,8 @@ fn handle_meta_command(cmd: &str, lisp: &Lisp<ARENA_SIZE>) -> bool {
 
     match command {
         ",help" => print_help(),
-        ",builtins" => print_builtins(),
-        ",doc" => print_doc(arg),
+        ",builtins" => print_builtins(docs),
+        ",doc" => print_doc(arg, docs),
         ",check" => run_check(arg),
         ",env" | ",stats" => print_stats(lisp),
         ",quit" | ",exit" | ",q" => return true,
@@ -55,233 +60,44 @@ fn print_help() {
     println!();
 }
 
-fn print_builtins() {
+fn print_builtins(docs: &[(&'static str, DocEntry)]) {
+    let operatives: Vec<&str> = docs
+        .iter()
+        .filter(|(_, e)| e.kind == DocKind::Operative)
+        .map(|(name, _)| *name)
+        .collect();
+
+    let applicatives: Vec<&str> = docs
+        .iter()
+        .filter(|(_, e)| e.kind == DocKind::Applicative)
+        .map(|(name, _)| *name)
+        .collect();
+
     println!("Operatives (receive unevaluated operands):");
-    println!("  quote  if  define!  set!  lambda  vau  begin  cond  and  or  let");
+    println!("  {}", operatives.join("  "));
     println!();
     println!("Applicatives (evaluate arguments first):");
-    println!("  Arithmetic:   +  -  *  /");
-    println!("  Comparison:   =  <  >  <=  >=");
-    println!("  Pairs/Lists:  cons  car  cdr  list");
-    println!("  Predicates:   null?  pair?  number?  symbol?  boolean?");
-    println!("                inert?  ignore?  operative?  applicative?  environment?");
-    println!("  Equality:     eq?  equal?  not");
-    println!("  Combiners:    eval  wrap  unwrap");
-    println!("  Environments: make-environment  make-empty-environment");
+    for chunk in applicatives.chunks(8) {
+        println!("  {}", chunk.join("  "));
+    }
     println!();
     println!("Use ,doc <name> for details on any builtin.");
 }
 
-fn print_doc(name: &str) {
+fn print_doc(name: &str, docs: &[(&'static str, DocEntry)]) {
     if name.is_empty() {
         println!("Usage: ,doc <name>");
         println!("Example: ,doc lambda");
         return;
     }
 
-    match name {
-        "quote" => {
-            println!("(quote expr) → expr");
+    match docs.iter().find(|(n, _)| *n == name) {
+        Some((_, entry)) => {
+            println!("{}", entry.signature);
             println!();
-            println!("  Return expr without evaluating it.");
-            println!("  Shorthand: 'expr");
-            println!();
-            println!("  (quote (+ 1 2))   ; → (+ 1 2)");
+            println!("  {}", entry.description);
         }
-        "if" => {
-            println!("(if test consequent [alternative])");
-            println!();
-            println!("  Evaluate test. If #t, evaluate consequent (tail position).");
-            println!("  If #f, evaluate alternative (tail position), or () if omitted.");
-            println!("  Test must evaluate to a boolean.");
-            println!();
-            println!("  (if #t 1 2)        ; → 1");
-            println!("  (if (< 3 5) 10 20) ; → 10");
-        }
-        "define!" => {
-            println!("(define! definiend expression)");
-            println!();
-            println!("  Evaluate expression, then match definiend (parameter tree)");
-            println!("  against the result, binding symbols in the current environment.");
-            println!("  Returns #inert.");
-            println!();
-            println!("  (define! x 42)");
-            println!("  (define! (a b) (list 1 2))");
-        }
-        "set!" => {
-            println!("(set! env-expr definiend expression)");
-            println!();
-            println!("  Evaluate env-expr to get a target environment and expression");
-            println!("  to get a value, then bind definiend in the target environment.");
-            println!("  Returns #inert.");
-        }
-        "lambda" => {
-            println!("(lambda params body ...)");
-            println!();
-            println!("  Create an applicative (arguments are evaluated before binding).");
-            println!("  Equivalent to (wrap (vau params #ignore (begin body ...))).");
-            println!("  Multiple body expressions are wrapped in begin.");
-            println!();
-            println!("  (define! add1 (lambda (x) (+ x 1)))");
-            println!("  (add1 5)  ; → 6");
-        }
-        "vau" => {
-            println!("(vau params env-param body ...)");
-            println!();
-            println!("  Create an operative (fexpr). Operands are NOT evaluated.");
-            println!("  params: formal parameter tree matched against unevaluated operands.");
-            println!("  env-param: symbol bound to caller's environment, or #ignore.");
-            println!();
-            println!("  (define! my-quote (vau (x) #ignore x))");
-            println!("  (my-quote (+ 1 2))  ; → (+ 1 2)");
-        }
-        "begin" => {
-            println!("(begin expr1 expr2 ... exprN)");
-            println!();
-            println!("  Evaluate each expression in order. Last is in tail position.");
-            println!("  Returns the value of the last expression, or () if empty.");
-        }
-        "cond" => {
-            println!("(cond (test1 body1 ...) (test2 body2 ...) ... (else bodyN ...))");
-            println!();
-            println!("  Evaluate tests in order until one returns #t or else is reached.");
-            println!("  Evaluate the corresponding body (last in tail position).");
-        }
-        "and" => {
-            println!("(and expr1 expr2 ... exprN)");
-            println!();
-            println!("  Short-circuit: returns #f immediately if any expr is #f.");
-            println!("  Otherwise returns result of last expr. With no args, returns #t.");
-        }
-        "or" => {
-            println!("(or expr1 expr2 ... exprN)");
-            println!();
-            println!("  Short-circuit: returns #t immediately if any expr is #t.");
-            println!("  Otherwise returns result of last expr. With no args, returns #f.");
-        }
-        "let" => {
-            println!("(let ((name1 val1) (name2 val2) ...) body ...)");
-            println!();
-            println!("  Create a child environment, evaluate vals in the outer environment,");
-            println!("  bind names in the child, evaluate body in the child.");
-            println!();
-            println!("  (let ((x 10) (y 20)) (+ x y))  ; → 30");
-        }
-        "+" => {
-            println!("(+ . numbers) → number");
-            println!();
-            println!("  Variadic addition. Zero arguments returns 0.");
-            println!("  Uses checked arithmetic (overflow signals ArithmeticOverflow).");
-            println!();
-            println!("  (+ 1 2 3)  ; → 6");
-            println!("  (+)        ; → 0");
-        }
-        "-" => {
-            println!("(- n . rest) → number");
-            println!();
-            println!("  With one arg: negate. With two+: left fold subtraction.");
-            println!();
-            println!("  (- 10 3)  ; → 7");
-            println!("  (- 5)    ; → -5");
-        }
-        "*" => {
-            println!("(* . numbers) → number");
-            println!();
-            println!("  Variadic multiplication. Zero arguments returns 1.");
-            println!();
-            println!("  (* 2 3 4)  ; → 24");
-            println!("  (*)        ; → 1");
-        }
-        "/" => {
-            println!("(/ a b) → number");
-            println!();
-            println!("  Integer (truncating) division. DivisionByZero if b is 0.");
-            println!();
-            println!("  (/ 10 3)  ; → 3");
-        }
-        "=" | "<" | ">" | "<=" | ">=" => {
-            println!("({name} a b) → boolean");
-            println!();
-            println!("  Numeric comparison. Both arguments must be numbers.");
-        }
-        "cons" => {
-            println!("(cons a b) → pair");
-            println!();
-            println!("  Construct a pair (cons cell).");
-            println!();
-            println!("  (cons 1 2)          ; → (1 . 2)");
-            println!("  (cons 1 (list 2 3)) ; → (1 2 3)");
-        }
-        "car" => {
-            println!("(car pair) → value");
-            println!();
-            println!("  Return the first element of a pair.");
-        }
-        "cdr" => {
-            println!("(cdr pair) → value");
-            println!();
-            println!("  Return the second element of a pair.");
-        }
-        "list" => {
-            println!("(list . items) → list");
-            println!();
-            println!("  Return the argument list as-is (already a proper list).");
-            println!();
-            println!("  (list 1 2 3)  ; → (1 2 3)");
-        }
-        "null?" | "pair?" | "number?" | "symbol?" | "boolean?" | "inert?" | "ignore?"
-        | "operative?" | "applicative?" | "environment?" => {
-            println!("({name} . objects) → boolean");
-            println!();
-            println!("  Variadic type predicate. Returns #t iff every argument");
-            println!("  matches the type.");
-        }
-        "not" => {
-            println!("(not boolean) → boolean");
-            println!();
-            println!("  Boolean negation. Argument must be a boolean.");
-        }
-        "eq?" => {
-            println!("(eq? a b) → boolean");
-            println!();
-            println!("  Identity equality. For immutable scalar types, compares by value.");
-            println!("  For mutable/constructed types, compares by arena identity.");
-        }
-        "equal?" => {
-            println!("(equal? a b) → boolean");
-            println!();
-            println!("  Structural equality. Returns #t whenever eq? would.");
-            println!("  Additionally compares pairs recursively and strings char-by-char.");
-        }
-        "eval" => {
-            println!("(eval expr [env]) → value");
-            println!();
-            println!("  Evaluate expr in the given environment (defaults to standard env).");
-            println!();
-            println!("  (eval (list '+ 1 2))  ; → 3");
-        }
-        "wrap" => {
-            println!("(wrap combiner) → applicative");
-            println!();
-            println!("  Wrap a combiner in an applicative.");
-            println!("  Arguments will be evaluated before reaching the combiner.");
-        }
-        "unwrap" => {
-            println!("(unwrap applicative) → combiner");
-            println!();
-            println!("  Extract the underlying combiner from an applicative.");
-        }
-        "make-environment" => {
-            println!("(make-environment . envs) → environment");
-            println!();
-            println!("  Create a new environment with the given parent environments.");
-        }
-        "make-empty-environment" => {
-            println!("(make-empty-environment) → environment");
-            println!();
-            println!("  Create a new environment with no parents.");
-        }
-        _ => {
+        None => {
             eprintln!("No documentation for '{name}'.");
             eprintln!("Use ,builtins to see all available builtins.");
         }
@@ -385,6 +201,50 @@ fn main() {
                 }
                 return;
             }
+            "lsp" => {
+                // Launch the grift-lsp binary (installed alongside grift)
+                let exe = std::env::current_exe().ok().and_then(|p| {
+                    let dir = p.parent()?;
+                    let lsp = dir.join("grift-lsp");
+                    lsp.exists().then_some(lsp)
+                });
+
+                match exe {
+                    Some(lsp_path) => {
+                        let status = std::process::Command::new(lsp_path)
+                            .stdin(std::process::Stdio::inherit())
+                            .stdout(std::process::Stdio::inherit())
+                            .stderr(std::process::Stdio::inherit())
+                            .status();
+                        match status {
+                            Ok(s) => std::process::exit(s.code().unwrap_or(0)),
+                            Err(e) => {
+                                eprintln!("Failed to start grift-lsp: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    None => {
+                        // Fallback: try PATH
+                        let status = std::process::Command::new("grift-lsp")
+                            .stdin(std::process::Stdio::inherit())
+                            .stdout(std::process::Stdio::inherit())
+                            .stderr(std::process::Stdio::inherit())
+                            .status();
+                        match status {
+                            Ok(s) => std::process::exit(s.code().unwrap_or(0)),
+                            Err(_) => {
+                                eprintln!("grift-lsp not found. Build it with:");
+                                eprintln!("  cargo build -p grift_lsp");
+                                eprintln!();
+                                eprintln!("Or run it directly:");
+                                eprintln!("  cargo run -p grift_lsp");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+            }
             "help" | "--help" | "-h" => {
                 println!("grift — A no_std Lisp interpreter (vau calculus)");
                 println!();
@@ -392,6 +252,7 @@ fn main() {
                 println!("  grift              Start the interactive REPL");
                 println!("  grift run <file>   Execute a Grift source file");
                 println!("  grift check <src>  Run static analysis on a file or expression");
+                println!("  grift lsp          Start the LSP server (stdio)");
                 println!("  grift help         Show this help message");
                 println!();
                 println!("REPL COMMANDS:");
@@ -417,6 +278,7 @@ fn main() {
 
     // Start the REPL
     let lisp: Lisp<ARENA_SIZE> = Lisp::new();
+    let docs = builtin_docs();
     let mut rl = DefaultEditor::new().expect("failed to initialize editor");
 
     print_banner();
@@ -432,10 +294,41 @@ fn main() {
 
                 // Handle meta-commands
                 if line.starts_with(',') {
-                    if handle_meta_command(line, &lisp) {
+                    if handle_meta_command(line, &lisp, &docs) {
                         break;
                     }
                     continue;
+                }
+
+                // Run static analysis first for better error messages
+                let check_result = grift_check::check(line);
+                if !check_result.is_ok() {
+                    for d in &check_result.diagnostics {
+                        let severity = match d.severity {
+                            grift_check::Severity::Error => "error",
+                            grift_check::Severity::Warning => "warning",
+                            grift_check::Severity::Hint => "hint",
+                        };
+                        eprintln!(
+                            "[{severity}] {}:{}: {}",
+                            d.start.line + 1,
+                            d.start.col + 1,
+                            d.message
+                        );
+                    }
+                    continue;
+                }
+
+                // Show warnings but still evaluate
+                for d in &check_result.diagnostics {
+                    if d.severity == grift_check::Severity::Warning {
+                        eprintln!(
+                            "[warning] {}:{}: {}",
+                            d.start.line + 1,
+                            d.start.col + 1,
+                            d.message
+                        );
+                    }
                 }
 
                 match lisp.eval(line) {

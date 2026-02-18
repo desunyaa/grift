@@ -10,6 +10,9 @@
 //! - **Bracket matching**: Reports unmatched parentheses with positions
 //! - **String validation**: Detects unterminated string literals
 //! - **Diagnostics**: Returns structured diagnostic messages with severity and location
+//! - **Documentation database**: Structured docs for all builtins, shared by REPL and LSP
+
+pub mod docs;
 
 /// Severity level for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
