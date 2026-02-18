@@ -5,6 +5,7 @@ members = [
     "crates/grift_unicode",
 
     "crates/grift",
+    "crates/grift_check",
     "crates/grift_lsp",
 ]
 
