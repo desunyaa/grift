@@ -8,9 +8,8 @@
 //!
 //! - **Syntax checking**: Validates S-expression syntax (balanced parens, valid tokens)
 //! - **Bracket matching**: Reports unmatched parentheses with positions
+//! - **String validation**: Detects unterminated string literals
 //! - **Diagnostics**: Returns structured diagnostic messages with severity and location
-
-use grift::{Lisp, ArenaError};
 
 /// Severity level for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,8 +72,7 @@ impl CheckResult {
 ///
 /// Performs the following checks:
 /// 1. Bracket matching (unmatched parentheses)
-/// 2. Parse validation (attempts to parse each top-level expression)
-/// 3. String literal validation (unterminated strings)
+/// 2. String literal validation (unterminated strings)
 ///
 /// # Example
 ///
@@ -96,14 +94,6 @@ pub fn check(source: &str) -> CheckResult {
 
     // Check string literals
     check_strings(source, &mut diagnostics);
-
-    // If bracket/string issues found, skip parse check (it will fail anyway)
-    if diagnostics.iter().any(|d| d.severity == Severity::Error) {
-        return CheckResult { diagnostics };
-    }
-
-    // Try to parse each top-level expression
-    check_parse(source, &mut diagnostics);
 
     CheckResult { diagnostics }
 }
@@ -135,22 +125,20 @@ fn check_brackets(source: &str, diagnostics: &mut Vec<Diagnostic>) {
     while i < bytes.len() {
         match bytes[i] {
             b';' => {
-                // Skip line comments
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
             }
             b'"' => {
-                // Skip string literals
                 i += 1;
                 while i < bytes.len() && bytes[i] != b'"' {
                     if bytes[i] == b'\\' {
-                        i += 1; // skip escaped char
+                        i += 1;
                     }
                     i += 1;
                 }
                 if i < bytes.len() {
-                    i += 1; // skip closing quote
+                    i += 1;
                 }
             }
             b'(' => {
@@ -175,7 +163,6 @@ fn check_brackets(source: &str, diagnostics: &mut Vec<Diagnostic>) {
         }
     }
 
-    // Report any unclosed opening parens
     for &open_offset in &stack {
         let pos = offset_to_position(source, open_offset);
         diagnostics.push(Diagnostic {
@@ -223,23 +210,6 @@ fn check_strings(source: &str, diagnostics: &mut Vec<Diagnostic>) {
             _ => {
                 i += 1;
             }
-        }
-    }
-}
-
-/// Try to parse the source and report any parse errors.
-fn check_parse(source: &str, diagnostics: &mut Vec<Diagnostic>) {
-    let lisp: Lisp<1024> = Lisp::new();
-    if let Err(e) = lisp.eval(source) {
-        // Only report parse errors - runtime errors are not static check failures
-        if matches!(e, ArenaError::ParseError) {
-            let pos = Position { line: 0, col: 0 };
-            diagnostics.push(Diagnostic {
-                severity: Severity::Error,
-                start: pos,
-                end: pos,
-                message: format!("Parse error: {:?}", e),
-            });
         }
     }
 }
