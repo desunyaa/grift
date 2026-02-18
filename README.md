@@ -85,6 +85,77 @@ Run the REPL (requires the `repl` feature):
 cargo run -p grift --features repl
 ```
 
+## Tooling
+
+### Interactive REPL
+
+The REPL provides a rich interactive environment with meta-commands:
+
+```
+Λ> ,help              Show available commands
+Λ> ,builtins          List all built-in operatives and applicatives
+Λ> ,doc lambda        Show documentation for a builtin
+Λ> ,check (+ 1 2)    Run static analysis on an expression
+Λ> ,env               Show arena allocation statistics
+Λ> ,quit              Exit the REPL
+```
+
+### CLI Commands
+
+```bash
+grift help             # Show usage information
+grift run <file>       # Execute a Grift source file
+grift check <src>      # Run static analysis on a file or expression
+```
+
+### Static Analysis (`grift_check`)
+
+The `grift_check` crate provides standalone static analysis:
+
+- Bracket matching (unmatched parentheses)
+- String literal validation (unterminated strings)
+- Position tracking for all diagnostics
+
+```rust
+use grift_check::check;
+
+let result = check("(+ 1 2)");
+assert!(result.is_ok());
+
+let result = check("(+ 1 2");
+assert!(!result.is_ok()); // reports unmatched parenthesis
+```
+
+### Language Server (`grift_lsp`)
+
+The `grift_lsp` crate provides an LSP server for IDE integration:
+
+- **Diagnostics**: Parse error detection with position information
+- **Hover**: Documentation for all 37 built-in operatives and applicatives
+- **Completion**: Auto-complete for all builtins and keywords
+
+Run the LSP server:
+
+```bash
+cargo run -p grift_lsp
+```
+
+Configure in your editor (e.g., VS Code `settings.json`):
+
+```json
+{
+  "grift.lsp.path": "path/to/grift-lsp"
+}
+```
+
+### API Documentation
+
+Generate comprehensive HTML documentation for all crates:
+
+```bash
+cargo doc --workspace --open
+```
+
 ## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) -- System architecture, arena design, GC, TCO
