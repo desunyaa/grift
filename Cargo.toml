@@ -5,6 +5,7 @@ members = [
     "crates/grift_unicode",
 
     "crates/grift",
+    "crates/grift_lsp",
 ]
 
 [workspace.package]
@@ -14,6 +15,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 grift_arena = { version = "1.5.0", path = "crates/grift_arena" }
+grift = { version = "1.5.0", path = "crates/grift" }
 
 # Use basic optimizations in dev/test builds to prevent stack overflows
 # caused by deep recursion in the Scheme evaluator. Without optimizations,

@@ -1,0 +1,16 @@
+[package]
+name = "grift_lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Language Server Protocol implementation for the Grift Lisp"
+
+[[bin]]
+name = "grift-lsp"
+path = "src/main.rs"
+
+[dependencies]
+grift.workspace = true
+grift_arena.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
