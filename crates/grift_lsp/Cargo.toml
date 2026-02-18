@@ -12,5 +12,6 @@ path = "src/main.rs"
 [dependencies]
 grift.workspace = true
 grift_arena.workspace = true
+grift_check = { version = "1.5.0", path = "../grift_check" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

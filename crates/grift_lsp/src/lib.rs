@@ -431,6 +431,15 @@ pub struct TextDocumentContentChangeEvent {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DidSaveParams {
+    pub text_document: TextDocumentIdentifier,
+    /// The content of the saved file. Only sent if the server requested
+    /// `includeText` in save options.
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HoverParams {
     pub text_document: TextDocumentIdentifier,
     pub position: Position,
@@ -474,6 +483,40 @@ pub struct CompletionItem {
     pub documentation: Option<MarkupContent>,
 }
 
+// ── Signature Help types ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureHelpParams {
+    pub text_document: TextDocumentIdentifier,
+    pub position: Position,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureHelp {
+    pub signatures: Vec<SignatureInformation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_signature: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_parameter: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureInformation {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<MarkupContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Vec<ParameterInformation>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ParameterInformation {
+    pub label: String,
+}
+
 // ── Language Server ─────────────────────────────────────────────────────────
 
 pub struct GriftLanguageServer {
@@ -493,9 +536,16 @@ impl GriftLanguageServer {
     pub fn initialize(&self, id: Option<serde_json::Value>) -> RpcResponse {
         let capabilities = serde_json::json!({
             "capabilities": {
-                "textDocumentSync": 1,
+                "textDocumentSync": {
+                    "openClose": true,
+                    "change": 1,
+                    "save": { "includeText": true }
+                },
                 "hoverProvider": true,
                 "completionProvider": {
+                    "triggerCharacters": ["(", " "]
+                },
+                "signatureHelpProvider": {
                     "triggerCharacters": ["(", " "]
                 }
             },
@@ -531,6 +581,23 @@ impl GriftLanguageServer {
         }
     }
 
+    /// Handle `textDocument/didSave`.
+    ///
+    /// Re-publishes diagnostics on save. If the save includes text content,
+    /// updates the document store; otherwise uses the last known content.
+    pub fn did_save(&mut self, params: DidSaveParams) -> Option<RpcNotification> {
+        let uri = params.text_document.uri.clone();
+        if let Some(text) = params.text {
+            self.documents.insert(uri.clone(), text.clone());
+            Some(self.publish_diagnostics(&uri, &text))
+        } else {
+            self.documents
+                .get(&uri)
+                .cloned()
+                .map(|text| self.publish_diagnostics(&uri, &text))
+        }
+    }
+
     /// Run parse check and produce a diagnostics notification.
     fn publish_diagnostics(&self, uri: &str, text: &str) -> RpcNotification {
         let diagnostics = self.check_parse(text);
@@ -546,12 +613,48 @@ impl GriftLanguageServer {
     }
 
     /// Attempt to parse the document and collect diagnostics.
+    ///
+    /// Uses `grift_check` for structural analysis (bracket matching, string
+    /// validation) which provides accurate source positions, then falls back
+    /// to eval-based checking to catch parse and evaluation errors.
     fn check_parse(&self, text: &str) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+
+        // Phase 1: Structural analysis via grift_check (accurate positions)
+        let check_result = grift_check::check(text);
+        for d in &check_result.diagnostics {
+            let severity = match d.severity {
+                grift_check::Severity::Error => 1,   // LSP Error
+                grift_check::Severity::Warning => 2, // LSP Warning
+                grift_check::Severity::Hint => 3,    // LSP Information
+            };
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: d.start.line as u32,
+                        character: d.start.col as u32,
+                    },
+                    end: Position {
+                        line: d.end.line as u32,
+                        character: d.end.col as u32,
+                    },
+                },
+                severity: Some(severity),
+                message: d.message.clone(),
+            });
+        }
+
+        // If structural errors found, skip eval (it will fail due to the same issues)
+        if !check_result.is_ok() {
+            return diagnostics;
+        }
+
+        // Phase 2: Eval-based checking for parse/runtime errors
         let lisp: Lisp<20000> = Lisp::new();
         match lisp.eval(text) {
-            Ok(_) => Vec::new(),
+            Ok(_) => {}
             Err(ArenaError::ParseError) => {
-                vec![Diagnostic {
+                diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position {
                             line: 0,
@@ -564,13 +667,11 @@ impl GriftLanguageServer {
                     },
                     severity: Some(1), // Error
                     message: "Parse error: malformed S-expression".into(),
-                }]
+                });
             }
             Err(e) => {
                 // Non-parse errors mean parsing succeeded; report as warnings
-                // only if they're evaluation-time issues. For a pure parse check
-                // we could ignore these, but surfacing them is helpful.
-                vec![Diagnostic {
+                diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position {
                             line: 0,
@@ -583,9 +684,11 @@ impl GriftLanguageServer {
                     },
                     severity: Some(2), // Warning
                     message: format!("{}", e),
-                }]
+                });
             }
         }
+
+        diagnostics
     }
 
     /// Handle `textDocument/hover`.
@@ -616,6 +719,29 @@ impl GriftLanguageServer {
                 }),
             })
             .collect()
+    }
+
+    /// Handle `textDocument/signatureHelp`.
+    ///
+    /// Finds the innermost open parenthesis before the cursor, extracts the
+    /// symbol immediately following it, and returns the matching builtin
+    /// signature.
+    pub fn handle_signature_help(&self, params: SignatureHelpParams) -> Option<SignatureHelp> {
+        let text = self.documents.get(&params.text_document.uri)?;
+        let symbol = enclosing_call_symbol(text, &params.position)?;
+        let entry = self.docs.get(symbol.as_str())?;
+        Some(SignatureHelp {
+            signatures: vec![SignatureInformation {
+                label: entry.signature.to_string(),
+                documentation: Some(MarkupContent {
+                    kind: "markdown".into(),
+                    value: entry.description.to_string(),
+                }),
+                parameters: None,
+            }],
+            active_signature: Some(0),
+            active_parameter: None,
+        })
     }
 
     /// Handle `shutdown`.
@@ -663,6 +789,57 @@ fn word_at_position(text: &str, pos: &Position) -> Option<String> {
         return None;
     }
     Some(line[start..end].to_string())
+}
+
+/// Find the symbol at the head of the innermost S-expression enclosing the
+/// cursor position. Works across lines by computing a flat byte offset.
+///
+/// For example, given `(define! x (+ 1 |))` with cursor at `|`, this returns
+/// `Some("+")`.  Given `(define! |x 42)`, this returns `Some("define!")`.
+fn enclosing_call_symbol(text: &str, pos: &Position) -> Option<String> {
+    let is_symbol_char =
+        |b: u8| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'(' | b')' | b'"' | b';');
+
+    // Convert line/character to a byte offset
+    let mut offset = 0usize;
+    for (i, line) in text.lines().enumerate() {
+        if i == pos.line as usize {
+            offset += (pos.character as usize).min(line.len());
+            break;
+        }
+        offset += line.len() + 1; // +1 for '\n'
+    }
+
+    // Walk backwards to find the nearest unmatched '('
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = offset.min(bytes.len());
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                if depth == 0 {
+                    // Found the opening paren — extract the symbol after it
+                    let mut start = i + 1;
+                    while start < bytes.len() && matches!(bytes[start], b' ' | b'\t' | b'\n') {
+                        start += 1;
+                    }
+                    let mut end = start;
+                    while end < bytes.len() && is_symbol_char(bytes[end]) {
+                        end += 1;
+                    }
+                    if start < end {
+                        return Some(text[start..end].to_string());
+                    }
+                    return None;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 // ── LSP message framing (Content-Length) ────────────────────────────────────
@@ -837,5 +1014,163 @@ mod tests {
         assert!(resp.result.is_some());
         let caps = resp.result.unwrap();
         assert!(caps["capabilities"]["hoverProvider"].as_bool().unwrap());
+    }
+
+    // ── New feature tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_diagnostics_unmatched_paren_has_position() {
+        let server = GriftLanguageServer::new();
+        // Second line has unmatched paren — grift_check should report line 1
+        let diags = server.check_parse("(+ 1 2)\n(+ 3");
+        assert!(!diags.is_empty());
+        let err = &diags[0];
+        assert_eq!(err.severity, Some(1)); // Error
+        assert!(err.message.contains("Unmatched"));
+    }
+
+    #[test]
+    fn test_diagnostics_arity_warning() {
+        let server = GriftLanguageServer::new();
+        let diags = server.check_parse("(define!)");
+        // Should have a warning from grift_check about arity
+        let warnings: Vec<_> = diags.iter().filter(|d| d.severity == Some(2)).collect();
+        assert!(!warnings.is_empty());
+        assert!(warnings[0].message.contains("define!"));
+    }
+
+    #[test]
+    fn test_did_save_with_text() {
+        let mut server = GriftLanguageServer::new();
+        let result = server.did_save(DidSaveParams {
+            text_document: TextDocumentIdentifier {
+                uri: "file:///test.grift".into(),
+            },
+            text: Some("(+ 1 2)".into()),
+        });
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_did_save_without_text_uses_stored() {
+        let mut server = GriftLanguageServer::new();
+        server
+            .documents
+            .insert("file:///test.grift".into(), "(+ 1 2)".into());
+        let result = server.did_save(DidSaveParams {
+            text_document: TextDocumentIdentifier {
+                uri: "file:///test.grift".into(),
+            },
+            text: None,
+        });
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_did_save_without_text_no_stored() {
+        let mut server = GriftLanguageServer::new();
+        let result = server.did_save(DidSaveParams {
+            text_document: TextDocumentIdentifier {
+                uri: "file:///unknown.grift".into(),
+            },
+            text: None,
+        });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_enclosing_call_symbol_simple() {
+        // (cons 1 |2) — cursor on '2', should find "cons"
+        let sym = enclosing_call_symbol(
+            "(cons 1 2)",
+            &Position {
+                line: 0,
+                character: 8,
+            },
+        );
+        assert_eq!(sym, Some("cons".into()));
+    }
+
+    #[test]
+    fn test_enclosing_call_symbol_nested() {
+        // (define! x (+ 1 |2)) — cursor inside (+ ...), should find "+"
+        let sym = enclosing_call_symbol(
+            "(define! x (+ 1 2))",
+            &Position {
+                line: 0,
+                character: 16,
+            },
+        );
+        assert_eq!(sym, Some("+".into()));
+    }
+
+    #[test]
+    fn test_enclosing_call_symbol_at_open() {
+        // (|define! x 42) — cursor right after '(', should find "define!"
+        let sym = enclosing_call_symbol(
+            "(define! x 42)",
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        );
+        assert_eq!(sym, Some("define!".into()));
+    }
+
+    #[test]
+    fn test_signature_help_known_builtin() {
+        let mut server = GriftLanguageServer::new();
+        server
+            .documents
+            .insert("file:///test.grift".into(), "(cons 1 2)".into());
+        let result = server.handle_signature_help(SignatureHelpParams {
+            text_document: TextDocumentIdentifier {
+                uri: "file:///test.grift".into(),
+            },
+            position: Position {
+                line: 0,
+                character: 6,
+            },
+        });
+        assert!(result.is_some());
+        let help = result.unwrap();
+        assert_eq!(help.signatures.len(), 1);
+        assert!(help.signatures[0].label.contains("cons"));
+    }
+
+    #[test]
+    fn test_signature_help_unknown() {
+        let mut server = GriftLanguageServer::new();
+        server
+            .documents
+            .insert("file:///test.grift".into(), "(foo 1 2)".into());
+        let result = server.handle_signature_help(SignatureHelpParams {
+            text_document: TextDocumentIdentifier {
+                uri: "file:///test.grift".into(),
+            },
+            position: Position {
+                line: 0,
+                character: 5,
+            },
+        });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_initialize_has_save_support() {
+        let server = GriftLanguageServer::new();
+        let resp = server.initialize(Some(serde_json::json!(1)));
+        let caps = resp.result.unwrap();
+        // textDocumentSync should be an object with save support
+        let sync = &caps["capabilities"]["textDocumentSync"];
+        assert!(sync["save"].is_object());
+    }
+
+    #[test]
+    fn test_initialize_has_signature_help() {
+        let server = GriftLanguageServer::new();
+        let resp = server.initialize(Some(serde_json::json!(1)));
+        let caps = resp.result.unwrap();
+        assert!(caps["capabilities"]["signatureHelpProvider"].is_object());
     }
 }
