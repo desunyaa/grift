@@ -2,7 +2,7 @@
 //!
 //! Tokenizes and parses Lisp source text into arena-allocated values.
 
-use grift_arena::{ArenaIndex, ArenaError, ArenaResult};
+use grift_arena::{ArenaError, ArenaIndex, ArenaResult};
 
 use crate::lisp::Lisp;
 
@@ -99,7 +99,9 @@ impl<'a> Parser<'a> {
     /// Check if current position is a dot separator (not a number like `.5`).
     fn peek_dot(&self) -> bool {
         self.input.get(self.pos) == Some(&b'.')
-            && self.input.get(self.pos + 1)
+            && self
+                .input
+                .get(self.pos + 1)
                 .is_none_or(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b')'))
     }
 
@@ -112,10 +114,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a string literal `"..."`.
-    fn parse_string_literal<const N: usize>(
-        &mut self,
-        lisp: &Lisp<N>,
-    ) -> ArenaResult<ArenaIndex> {
+    fn parse_string_literal<const N: usize>(&mut self, lisp: &Lisp<N>) -> ArenaResult<ArenaIndex> {
         let start = self.pos;
         while self.pos < self.input.len() && self.input[self.pos] != b'"' {
             if self.input[self.pos] == b'\\' {
@@ -172,7 +171,9 @@ fn parse_integer(s: &str) -> Option<isize> {
     };
 
     let magnitude = digits.iter().try_fold(0isize, |acc, &b| {
-        if !b.is_ascii_digit() { return None; }
+        if !b.is_ascii_digit() {
+            return None;
+        }
         acc.checked_mul(10)?.checked_add((b - b'0') as isize)
     })?;
 

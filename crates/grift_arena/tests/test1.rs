@@ -170,7 +170,10 @@ fn test_set_invalid_index() {
 
     // Out of bounds index
     let invalid_idx = ArenaIndex::new(100);
-    assert_eq!(arena.set(invalid_idx, 42), Err(ArenaError::IndexOutOfBounds));
+    assert_eq!(
+        arena.set(invalid_idx, 42),
+        Err(ArenaError::IndexOutOfBounds)
+    );
 }
 
 #[test]
@@ -2811,7 +2814,10 @@ fn test_modify_invalid() {
     let idx = arena.alloc(42).unwrap();
     arena.free(idx).unwrap();
 
-    assert_eq!(arena.modify(idx, |_| {}), Err(ArenaError::IndexNotAllocated));
+    assert_eq!(
+        arena.modify(idx, |_| {}),
+        Err(ArenaError::IndexNotAllocated)
+    );
 }
 
 #[test]
@@ -3434,7 +3440,10 @@ fn test_alloc_contiguous_zero_count() {
     let arena: Arena<isize, 100> = Arena::new(0);
 
     // Zero count should fail
-    assert_eq!(arena.alloc_contiguous(0, 0), Err(ArenaError::InvalidArgument));
+    assert_eq!(
+        arena.alloc_contiguous(0, 0),
+        Err(ArenaError::InvalidArgument)
+    );
 }
 
 #[test]

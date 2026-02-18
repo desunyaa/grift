@@ -229,8 +229,8 @@ fn print_doc(name: &str) {
             println!();
             println!("  (list 1 2 3)  ; → (1 2 3)");
         }
-        "null?" | "pair?" | "number?" | "symbol?" | "boolean?" | "inert?"
-        | "ignore?" | "operative?" | "applicative?" | "environment?" => {
+        "null?" | "pair?" | "number?" | "symbol?" | "boolean?" | "inert?" | "ignore?"
+        | "operative?" | "applicative?" | "environment?" => {
             println!("({name} . objects) → boolean");
             println!();
             println!("  Variadic type predicate. Returns #t iff every argument");
@@ -305,7 +305,12 @@ fn run_check(expr: &str) {
                 grift_check::Severity::Warning => "warning",
                 grift_check::Severity::Hint => "hint",
             };
-            println!("[{severity}] {}:{}: {}", d.start.line + 1, d.start.col + 1, d.message);
+            println!(
+                "[{severity}] {}:{}: {}",
+                d.start.line + 1,
+                d.start.col + 1,
+                d.message
+            );
         }
     }
 }
@@ -348,7 +353,12 @@ fn main() {
                             grift_check::Severity::Warning => "warning",
                             grift_check::Severity::Hint => "hint",
                         };
-                        println!("[{severity}] {}:{}: {}", d.start.line + 1, d.start.col + 1, d.message);
+                        println!(
+                            "[{severity}] {}:{}: {}",
+                            d.start.line + 1,
+                            d.start.col + 1,
+                            d.message
+                        );
                     }
                     std::process::exit(1);
                 }
@@ -431,7 +441,9 @@ fn main() {
                     Err(e) => eprintln!("error: {e:?}"),
                 }
             }
-            Err(rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof) => {
+            Err(
+                rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof,
+            ) => {
                 break;
             }
             Err(e) => {

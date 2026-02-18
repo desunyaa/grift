@@ -1,10 +1,10 @@
 //! The `Lisp` struct: arena wrapper with symbol interning and convenience methods.
 
-use grift_arena::{Arena, ArenaIndex, ArenaError, ArenaResult, ArenaStats, GcStats, Trace};
+use grift_arena::{Arena, ArenaError, ArenaIndex, ArenaResult, ArenaStats, GcStats, Trace};
 
-use crate::value::Value;
-use crate::parse::Parser;
 use crate::eval::Evaluator;
+use crate::parse::Parser;
+use crate::value::Value;
 
 /// A minimalistic Lisp interpreter backed by a fixed-size arena.
 ///
@@ -45,11 +45,25 @@ impl<const N: usize> Lisp<N> {
     pub fn new() -> Self {
         let arena = Arena::new(Value::Nil);
         let _ = arena.alloc(Value::Nil);
-        let true_idx = arena.alloc(Value::Boolean(true)).expect("arena too small for singletons");
-        let false_idx = arena.alloc(Value::Boolean(false)).expect("arena too small for singletons");
-        let inert_idx = arena.alloc(Value::Inert).expect("arena too small for singletons");
-        let ignore_idx = arena.alloc(Value::Ignore).expect("arena too small for singletons");
-        Lisp { arena, true_idx, false_idx, inert_idx, ignore_idx }
+        let true_idx = arena
+            .alloc(Value::Boolean(true))
+            .expect("arena too small for singletons");
+        let false_idx = arena
+            .alloc(Value::Boolean(false))
+            .expect("arena too small for singletons");
+        let inert_idx = arena
+            .alloc(Value::Inert)
+            .expect("arena too small for singletons");
+        let ignore_idx = arena
+            .alloc(Value::Ignore)
+            .expect("arena too small for singletons");
+        Lisp {
+            arena,
+            true_idx,
+            false_idx,
+            inert_idx,
+            ignore_idx,
+        }
     }
 
     // — Value constructors —
@@ -111,7 +125,11 @@ impl<const N: usize> Lisp<N> {
 
     /// Allocate a string value from a `&str`.
     pub(crate) fn alloc_string(&self, s: &str) -> ArenaResult<ArenaIndex> {
-        let len = if s.is_ascii() { s.len() } else { s.chars().count() };
+        let len = if s.is_ascii() {
+            s.len()
+        } else {
+            s.chars().count()
+        };
 
         if len == 0 {
             return self.arena.alloc(Value::String {
@@ -135,7 +153,11 @@ impl<const N: usize> Lisp<N> {
             return false;
         };
         // Fast path: for ASCII strings, byte length == char count.
-        let char_count = if s.is_ascii() { s.len() } else { s.chars().count() };
+        let char_count = if s.is_ascii() {
+            s.len()
+        } else {
+            s.chars().count()
+        };
         len == char_count
             && s.chars().enumerate().all(|(i, c)| {
                 self.arena
@@ -304,11 +326,7 @@ impl<const N: usize> Lisp<N> {
     /// Falls back to DFS with cycle detection only for multi-parent
     /// environments (created by `make-environment`).
     #[inline]
-    pub(crate) fn env_lookup(
-        &self,
-        env: ArenaIndex,
-        name: ArenaIndex,
-    ) -> ArenaResult<ArenaIndex> {
+    pub(crate) fn env_lookup(&self, env: ArenaIndex, name: ArenaIndex) -> ArenaResult<ArenaIndex> {
         let mut cur = env;
         while !cur.is_nil() {
             let Value::Environment { bindings, parents } = self.arena.get(cur)? else {
@@ -456,8 +474,14 @@ impl<const N: usize> Trace<Value, N> for Value {
     fn trace<F: FnMut(ArenaIndex)>(&self, mut tracer: F) {
         match *self {
             Value::Cons { car, cdr }
-            | Value::Operative { params_envparam: car, body_env: cdr }
-            | Value::Environment { bindings: car, parents: cdr } => {
+            | Value::Operative {
+                params_envparam: car,
+                body_env: cdr,
+            }
+            | Value::Environment {
+                bindings: car,
+                parents: cdr,
+            } => {
                 tracer(car);
                 tracer(cdr);
             }

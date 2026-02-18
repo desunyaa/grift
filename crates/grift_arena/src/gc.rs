@@ -3,9 +3,9 @@
 //! This module contains the mark-and-sweep garbage collection logic
 //! for the arena allocator.
 
-use crate::{Arena, ArenaIndex, GcStats};
-use crate::types::Slot;
 use crate::traits::Trace;
+use crate::types::Slot;
+use crate::{Arena, ArenaIndex, GcStats};
 
 impl<T: Copy, const N: usize> Arena<T, N> {
     /// Initialize roots into the mark stack.
@@ -259,7 +259,11 @@ impl<T: Copy, const N: usize> Arena<T, N> {
         T: Trace<T, N>,
     {
         if !self.is_gc_enabled() {
-            return GcStats { marked: 0, collected: 0, total_before: self.len() };
+            return GcStats {
+                marked: 0,
+                collected: 0,
+                total_before: self.len(),
+            };
         }
 
         let mut marked = [false; N];

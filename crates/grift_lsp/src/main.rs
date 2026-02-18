@@ -5,8 +5,8 @@
 use std::io::{self, BufReader};
 
 use grift_lsp::{
-    read_message, send_notification, send_response, CompletionParams, DidChangeParams,
-    DidOpenParams, GriftLanguageServer, HoverParams, RpcResponse,
+    CompletionParams, DidChangeParams, DidOpenParams, GriftLanguageServer, HoverParams,
+    RpcResponse, read_message, send_notification, send_response,
 };
 
 fn main() -> io::Result<()> {
@@ -19,12 +19,7 @@ fn main() -> io::Result<()> {
 
     eprintln!("grift-lsp: starting");
 
-    loop {
-        let msg = match read_message(&mut reader)? {
-            Some(msg) => msg,
-            None => break, // EOF
-        };
-
+    while let Some(msg) = read_message(&mut reader)? {
         let method = match msg.method.as_deref() {
             Some(m) => m,
             None => continue,
@@ -39,53 +34,51 @@ fn main() -> io::Result<()> {
                 // Client acknowledgement; nothing to do.
             }
             "textDocument/didOpen" => {
-                if let Some(params) = msg.params {
-                    if let Ok(p) = serde_json::from_value::<DidOpenParams>(params) {
-                        if let Some(notif) = server.did_open(p) {
-                            send_notification(&mut writer, &notif)?;
-                        }
-                    }
+                if let Some(params) = msg.params
+                    && let Ok(p) = serde_json::from_value::<DidOpenParams>(params)
+                    && let Some(notif) = server.did_open(p)
+                {
+                    send_notification(&mut writer, &notif)?;
                 }
             }
             "textDocument/didChange" => {
-                if let Some(params) = msg.params {
-                    if let Ok(p) = serde_json::from_value::<DidChangeParams>(params) {
-                        if let Some(notif) = server.did_change(p) {
-                            send_notification(&mut writer, &notif)?;
-                        }
-                    }
+                if let Some(params) = msg.params
+                    && let Ok(p) = serde_json::from_value::<DidChangeParams>(params)
+                    && let Some(notif) = server.did_change(p)
+                {
+                    send_notification(&mut writer, &notif)?;
                 }
             }
             "textDocument/hover" => {
-                if let Some(params) = msg.params {
-                    if let Ok(p) = serde_json::from_value::<HoverParams>(params) {
-                        let result = server.handle_hover(p);
-                        let resp = RpcResponse {
-                            jsonrpc: "2.0".into(),
-                            id: msg.id,
-                            result: Some(
-                                result
-                                    .and_then(|h| serde_json::to_value(h).ok())
-                                    .unwrap_or(serde_json::Value::Null),
-                            ),
-                            error: None,
-                        };
-                        send_response(&mut writer, &resp)?;
-                    }
+                if let Some(params) = msg.params
+                    && let Ok(p) = serde_json::from_value::<HoverParams>(params)
+                {
+                    let result = server.handle_hover(p);
+                    let resp = RpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: msg.id,
+                        result: Some(
+                            result
+                                .and_then(|h| serde_json::to_value(h).ok())
+                                .unwrap_or(serde_json::Value::Null),
+                        ),
+                        error: None,
+                    };
+                    send_response(&mut writer, &resp)?;
                 }
             }
             "textDocument/completion" => {
-                if let Some(params) = msg.params {
-                    if let Ok(_p) = serde_json::from_value::<CompletionParams>(params) {
-                        let items = server.handle_completion();
-                        let resp = RpcResponse {
-                            jsonrpc: "2.0".into(),
-                            id: msg.id,
-                            result: serde_json::to_value(items).ok(),
-                            error: None,
-                        };
-                        send_response(&mut writer, &resp)?;
-                    }
+                if let Some(params) = msg.params
+                    && let Ok(_p) = serde_json::from_value::<CompletionParams>(params)
+                {
+                    let items = server.handle_completion();
+                    let resp = RpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: msg.id,
+                        result: serde_json::to_value(items).ok(),
+                        error: None,
+                    };
+                    send_response(&mut writer, &resp)?;
                 }
             }
             "shutdown" => {

@@ -4,9 +4,9 @@
 
 use core::cell::Cell;
 
-use crate::{ArenaIndex, ArenaError, ArenaResult, ArenaStats, ArenaDelete, ArenaCopy};
-use crate::types::{Slot, FREE_LIST_END};
 use crate::iter::ArenaIterator;
+use crate::types::{FREE_LIST_END, Slot};
+use crate::{ArenaCopy, ArenaDelete, ArenaError, ArenaIndex, ArenaResult, ArenaStats};
 
 /// Fixed-size arena allocator with O(1) allocation.
 ///
@@ -371,7 +371,9 @@ impl<T: Copy, const N: usize> Arena<T, N> {
 
         // Push onto free list
         let free_head = self.free_head.get();
-        self.slots[idx].set(Slot::Free { next_free: free_head });
+        self.slots[idx].set(Slot::Free {
+            next_free: free_head,
+        });
         self.free_head.set(idx);
 
         // Decrement allocated count
@@ -443,7 +445,11 @@ impl<T: Copy, const N: usize> Arena<T, N> {
             (count + u32::from(is_free && !was_free), is_free)
         });
 
-        if fragments == 0 { 0.0 } else { fragments as f32 / N as f32 }
+        if fragments == 0 {
+            0.0
+        } else {
+            fragments as f32 / N as f32
+        }
     }
 
     /// Validate internal consistency of the arena.
@@ -592,11 +598,11 @@ impl<T: Copy, const N: usize> Arena<T, N> {
     // — Contiguous Allocation —
 
     /// Find a contiguous block of `count` free slots.
-    /// 
+    ///
     /// Returns the starting index if found, `None` otherwise.
-    /// 
+    ///
     /// # Algorithm
-    /// 
+    ///
     /// Linear scan through the slots array looking for consecutive free slots.
     /// Uses first-fit strategy for simplicity.
     fn find_contiguous_free_slots(&self, count: usize) -> Option<usize> {
@@ -628,31 +634,31 @@ impl<T: Copy, const N: usize> Arena<T, N> {
     }
 
     /// Allocate a contiguous block of `count` slots.
-    /// 
+    ///
     /// Returns the starting `ArenaIndex` if successful. The allocated slots
     /// are consecutive in memory, starting from the returned index.
-    /// 
+    ///
     /// # Use Case
-    /// 
+    ///
     /// This is primarily used for string storage where characters need to be
     /// stored in contiguous memory for efficient access. The first slot
     /// typically stores length metadata, followed by character data.
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns `ArenaError::InvalidArgument` if `count` is 0.
     /// Returns `ArenaError::OutOfMemory` if no contiguous block is available.
-    /// 
+    ///
     /// # Example
-    /// 
+    ///
     /// ```rust
     /// use grift_arena::Arena;
-    /// 
+    ///
     /// let arena: Arena<isize, 100> = Arena::new(0);
-    /// 
+    ///
     /// // Allocate 5 contiguous slots
     /// let start = arena.alloc_contiguous(5, 0).unwrap();
-    /// 
+    ///
     /// // All slots are consecutive
     /// for i in 0..5 {
     ///     let idx = arena.index_at_offset(start, i).unwrap();
@@ -664,7 +670,8 @@ impl<T: Copy, const N: usize> Arena<T, N> {
             return Err(ArenaError::InvalidArgument);
         }
 
-        let start_idx = self.find_contiguous_free_slots(count)
+        let start_idx = self
+            .find_contiguous_free_slots(count)
             .ok_or(ArenaError::OutOfMemory)?;
         let end_idx = start_idx + count;
 
@@ -693,7 +700,10 @@ impl<T: Copy, const N: usize> Arena<T, N> {
                     // Skip over all consecutive nodes in the range
                     let mut skip = next_free;
                     while skip != FREE_LIST_END && skip >= start_idx && skip < end_idx {
-                        if let Slot::Free { next_free: inner_next } = self.slots[skip].get() {
+                        if let Slot::Free {
+                            next_free: inner_next,
+                        } = self.slots[skip].get()
+                        {
                             skip = inner_next;
                         } else {
                             break;
@@ -721,22 +731,22 @@ impl<T: Copy, const N: usize> Arena<T, N> {
     }
 
     /// Get an ArenaIndex at a given offset from a starting index.
-    /// 
+    ///
     /// This is used to access slots within a contiguous allocation.
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns `ArenaError::IndexOutOfBounds` if the offset goes out of bounds
     /// or `ArenaError::IndexNotAllocated` if the slot is not allocated.
-    /// 
+    ///
     /// # Example
-    /// 
+    ///
     /// ```rust
     /// use grift_arena::Arena;
-    /// 
+    ///
     /// let arena: Arena<isize, 100> = Arena::new(0);
     /// let start = arena.alloc_contiguous(3, 0).unwrap();
-    /// 
+    ///
     /// // Access slot at offset 1
     /// let idx1 = arena.index_at_offset(start, 1).unwrap();
     /// arena.set(idx1, 42).unwrap();
@@ -748,7 +758,7 @@ impl<T: Copy, const N: usize> Arena<T, N> {
         if idx >= N {
             return Err(ArenaError::IndexOutOfBounds);
         }
-        
+
         // Verify the slot is actually occupied
         match self.slots[idx].get() {
             Slot::Occupied { .. } => Ok(index),
@@ -757,26 +767,26 @@ impl<T: Copy, const N: usize> Arena<T, N> {
     }
 
     /// Free a contiguous block starting at `start` with `count` slots.
-    /// 
+    ///
     /// All slots must be allocated.
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns `ArenaError::IndexOutOfBounds` if any slot is out of bounds, or
     /// `ArenaError::IndexNotAllocated` if any slot is not allocated.
-    /// 
+    ///
     /// # Example
-    /// 
+    ///
     /// ```rust
     /// use grift_arena::Arena;
-    /// 
+    ///
     /// let arena: Arena<isize, 100> = Arena::new(0);
     /// let start = arena.alloc_contiguous(5, 0).unwrap();
-    /// 
+    ///
     /// assert_eq!(arena.len(), 5);
-    /// 
+    ///
     /// arena.free_contiguous(start, 5).unwrap();
-    /// 
+    ///
     /// assert_eq!(arena.len(), 0);
     /// ```
     pub fn free_contiguous(&self, start: ArenaIndex, count: usize) -> ArenaResult<()> {
@@ -785,7 +795,9 @@ impl<T: Copy, const N: usize> Arena<T, N> {
         }
 
         let start_idx = start.raw();
-        let end_idx = start_idx.checked_add(count).ok_or(ArenaError::IndexOutOfBounds)?;
+        let end_idx = start_idx
+            .checked_add(count)
+            .ok_or(ArenaError::IndexOutOfBounds)?;
         if end_idx > N {
             return Err(ArenaError::IndexOutOfBounds);
         }
@@ -799,7 +811,11 @@ impl<T: Copy, const N: usize> Arena<T, N> {
         let free_head = self.free_head.get();
         for i in (0..count).rev() {
             let idx = start_idx + i;
-            let next = if i == count - 1 { free_head } else { start_idx + i + 1 };
+            let next = if i == count - 1 {
+                free_head
+            } else {
+                start_idx + i + 1
+            };
             self.slots[idx].set(Slot::Free { next_free: next });
         }
 

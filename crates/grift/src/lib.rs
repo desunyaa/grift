@@ -21,11 +21,11 @@
 //! assert_eq!(three, Ok(Value::Number(3)));
 //! ```
 
-mod value;
+mod eval;
 mod lisp;
 mod parse;
-mod eval;
+mod value;
 
-pub use value::{Value, BuiltinId};
+pub use grift_arena::{ArenaError, ArenaIndex, ArenaResult, ArenaStats, GcStats};
 pub use lisp::Lisp;
-pub use grift_arena::{ArenaIndex, ArenaError, ArenaResult, ArenaStats, GcStats};
+pub use value::{BuiltinId, Value};

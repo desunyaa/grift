@@ -281,9 +281,15 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     #[cold]
     fn collect_garbage(&self, expr: ArenaIndex, env: ArenaIndex) {
         self.lisp.arena.collect_garbage(&[
-            expr, env, self.ground_env, self.global_env, self.gc_roots,
-            self.lisp.true_idx, self.lisp.false_idx,
-            self.lisp.inert_idx, self.lisp.ignore_idx,
+            expr,
+            env,
+            self.ground_env,
+            self.global_env,
+            self.gc_roots,
+            self.lisp.true_idx,
+            self.lisp.false_idx,
+            self.lisp.inert_idx,
+            self.lisp.ignore_idx,
         ]);
     }
 
@@ -421,12 +427,7 @@ impl<'a, const N: usize> Evaluator<'a, N> {
     /// - If ptree is `#ignore`, do nothing.
     /// - If ptree is nil, obj must be nil (else error).
     /// - If ptree is a pair, obj must be a pair; match car/cdr recursively.
-    fn match_ptree(
-        &self,
-        ptree: ArenaIndex,
-        obj: ArenaIndex,
-        env: ArenaIndex,
-    ) -> ArenaResult<()> {
+    fn match_ptree(&self, ptree: ArenaIndex, obj: ArenaIndex, env: ArenaIndex) -> ArenaResult<()> {
         if ptree.is_nil() {
             if obj.is_nil() {
                 return Ok(());
@@ -435,9 +436,7 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         }
         match self.lisp.get(ptree)? {
             Value::Ignore => Ok(()),
-            Value::Symbol(_) => {
-                self.lisp.env_define(env, ptree, obj)
-            }
+            Value::Symbol(_) => self.lisp.env_define(env, ptree, obj),
             Value::Cons {
                 car: ptree_car,
                 cdr: ptree_cdr,

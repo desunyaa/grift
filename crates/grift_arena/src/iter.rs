@@ -1,7 +1,7 @@
 //! Iterator support for the arena.
 
-use crate::{Arena, ArenaIndex};
 use crate::types::Slot;
+use crate::{Arena, ArenaIndex};
 
 /// Iterator over allocated cells in the arena.
 pub struct ArenaIterator<'a, T: Copy, const N: usize> {

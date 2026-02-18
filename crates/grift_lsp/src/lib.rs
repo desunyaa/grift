@@ -26,11 +26,14 @@ pub fn builtin_docs() -> HashMap<&'static str, DocEntry> {
     let mut m = HashMap::new();
 
     // Operatives (keywords)
-    m.insert("quote", DocEntry {
-        signature: "(quote expr)",
-        description: "Return expr without evaluating it.",
-        kind: CompletionItemKind::Keyword,
-    });
+    m.insert(
+        "quote",
+        DocEntry {
+            signature: "(quote expr)",
+            description: "Return expr without evaluating it.",
+            kind: CompletionItemKind::Keyword,
+        },
+    );
     m.insert("if", DocEntry {
         signature: "(if test consequent [alternative])",
         description: "Evaluate test. If #t, evaluate consequent; if #f, evaluate alternative (or return () if omitted). test must be a boolean.",
@@ -83,111 +86,174 @@ pub fn builtin_docs() -> HashMap<&'static str, DocEntry> {
     });
 
     // Applicatives (functions)
-    m.insert("cons", DocEntry {
-        signature: "(cons a b)",
-        description: "Construct a pair.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("+", DocEntry {
-        signature: "(+ . numbers)",
-        description: "Sum. Zero arguments returns 0.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("-", DocEntry {
-        signature: "(- n . rest)",
-        description: "With one argument: negate. With two+: left fold subtraction.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("*", DocEntry {
-        signature: "(* . numbers)",
-        description: "Product. Zero arguments returns 1.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("/", DocEntry {
-        signature: "(/ a b)",
-        description: "Integer (truncating) division. DivisionByZero if b is 0.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("=", DocEntry {
-        signature: "(= a b)",
-        description: "Numeric equality. Both arguments must be numbers.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("<", DocEntry {
-        signature: "(< a b)",
-        description: "Less than. Both arguments must be numbers.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert(">", DocEntry {
-        signature: "(> a b)",
-        description: "Greater than. Both arguments must be numbers.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("<=", DocEntry {
-        signature: "(<= a b)",
-        description: "Less than or equal. Both arguments must be numbers.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert(">=", DocEntry {
-        signature: "(>= a b)",
-        description: "Greater than or equal. Both arguments must be numbers.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("car", DocEntry {
-        signature: "(car pair)",
-        description: "First element of a pair.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("cdr", DocEntry {
-        signature: "(cdr pair)",
-        description: "Second element of a pair.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("list", DocEntry {
-        signature: "(list . items)",
-        description: "Return the argument list as-is (already a proper list).",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("null?", DocEntry {
-        signature: "(null? . objects)",
-        description: "Returns #t if all arguments are ().",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("not", DocEntry {
-        signature: "(not boolean)",
-        description: "Boolean negation. Argument must be a boolean.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("pair?", DocEntry {
-        signature: "(pair? . objects)",
-        description: "Returns #t if all arguments are pairs.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("number?", DocEntry {
-        signature: "(number? . objects)",
-        description: "Returns #t if all arguments are numbers.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("symbol?", DocEntry {
-        signature: "(symbol? . objects)",
-        description: "Returns #t if all arguments are symbols.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("boolean?", DocEntry {
-        signature: "(boolean? . objects)",
-        description: "Returns #t if all arguments are booleans.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("inert?", DocEntry {
-        signature: "(inert? . objects)",
-        description: "Returns #t if all arguments are #inert.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("ignore?", DocEntry {
-        signature: "(ignore? . objects)",
-        description: "Returns #t if all arguments are #ignore.",
-        kind: CompletionItemKind::Function,
-    });
+    m.insert(
+        "cons",
+        DocEntry {
+            signature: "(cons a b)",
+            description: "Construct a pair.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "+",
+        DocEntry {
+            signature: "(+ . numbers)",
+            description: "Sum. Zero arguments returns 0.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "-",
+        DocEntry {
+            signature: "(- n . rest)",
+            description: "With one argument: negate. With two+: left fold subtraction.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "*",
+        DocEntry {
+            signature: "(* . numbers)",
+            description: "Product. Zero arguments returns 1.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "/",
+        DocEntry {
+            signature: "(/ a b)",
+            description: "Integer (truncating) division. DivisionByZero if b is 0.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "=",
+        DocEntry {
+            signature: "(= a b)",
+            description: "Numeric equality. Both arguments must be numbers.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "<",
+        DocEntry {
+            signature: "(< a b)",
+            description: "Less than. Both arguments must be numbers.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        ">",
+        DocEntry {
+            signature: "(> a b)",
+            description: "Greater than. Both arguments must be numbers.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "<=",
+        DocEntry {
+            signature: "(<= a b)",
+            description: "Less than or equal. Both arguments must be numbers.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        ">=",
+        DocEntry {
+            signature: "(>= a b)",
+            description: "Greater than or equal. Both arguments must be numbers.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "car",
+        DocEntry {
+            signature: "(car pair)",
+            description: "First element of a pair.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "cdr",
+        DocEntry {
+            signature: "(cdr pair)",
+            description: "Second element of a pair.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "list",
+        DocEntry {
+            signature: "(list . items)",
+            description: "Return the argument list as-is (already a proper list).",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "null?",
+        DocEntry {
+            signature: "(null? . objects)",
+            description: "Returns #t if all arguments are ().",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "not",
+        DocEntry {
+            signature: "(not boolean)",
+            description: "Boolean negation. Argument must be a boolean.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "pair?",
+        DocEntry {
+            signature: "(pair? . objects)",
+            description: "Returns #t if all arguments are pairs.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "number?",
+        DocEntry {
+            signature: "(number? . objects)",
+            description: "Returns #t if all arguments are numbers.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "symbol?",
+        DocEntry {
+            signature: "(symbol? . objects)",
+            description: "Returns #t if all arguments are symbols.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "boolean?",
+        DocEntry {
+            signature: "(boolean? . objects)",
+            description: "Returns #t if all arguments are booleans.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "inert?",
+        DocEntry {
+            signature: "(inert? . objects)",
+            description: "Returns #t if all arguments are #inert.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "ignore?",
+        DocEntry {
+            signature: "(ignore? . objects)",
+            description: "Returns #t if all arguments are #ignore.",
+            kind: CompletionItemKind::Function,
+        },
+    );
     m.insert("eq?", DocEntry {
         signature: "(eq? a b)",
         description: "Identity equality. Compares by value for scalars, by arena identity for constructed types.",
@@ -203,41 +269,59 @@ pub fn builtin_docs() -> HashMap<&'static str, DocEntry> {
         description: "Evaluate expr in the given environment (defaults to the standard environment if omitted).",
         kind: CompletionItemKind::Function,
     });
-    m.insert("wrap", DocEntry {
-        signature: "(wrap combiner)",
-        description: "Wrap a combiner in an applicative (arguments will be evaluated).",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("unwrap", DocEntry {
-        signature: "(unwrap applicative)",
-        description: "Extract the underlying combiner from an applicative.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("operative?", DocEntry {
-        signature: "(operative? . objects)",
-        description: "Returns #t if all arguments are operatives or builtins.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("applicative?", DocEntry {
-        signature: "(applicative? . objects)",
-        description: "Returns #t if all arguments are applicatives.",
-        kind: CompletionItemKind::Function,
-    });
+    m.insert(
+        "wrap",
+        DocEntry {
+            signature: "(wrap combiner)",
+            description: "Wrap a combiner in an applicative (arguments will be evaluated).",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "unwrap",
+        DocEntry {
+            signature: "(unwrap applicative)",
+            description: "Extract the underlying combiner from an applicative.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "operative?",
+        DocEntry {
+            signature: "(operative? . objects)",
+            description: "Returns #t if all arguments are operatives or builtins.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "applicative?",
+        DocEntry {
+            signature: "(applicative? . objects)",
+            description: "Returns #t if all arguments are applicatives.",
+            kind: CompletionItemKind::Function,
+        },
+    );
     m.insert("make-environment", DocEntry {
         signature: "(make-environment . envs)",
         description: "Create a new environment with the given parents. All arguments must be environments.",
         kind: CompletionItemKind::Function,
     });
-    m.insert("make-empty-environment", DocEntry {
-        signature: "(make-empty-environment)",
-        description: "Create a new environment with no parents.",
-        kind: CompletionItemKind::Function,
-    });
-    m.insert("environment?", DocEntry {
-        signature: "(environment? . objects)",
-        description: "Returns #t if all arguments are environments.",
-        kind: CompletionItemKind::Function,
-    });
+    m.insert(
+        "make-empty-environment",
+        DocEntry {
+            signature: "(make-empty-environment)",
+            description: "Create a new environment with no parents.",
+            kind: CompletionItemKind::Function,
+        },
+    );
+    m.insert(
+        "environment?",
+        DocEntry {
+            signature: "(environment? . objects)",
+            description: "Returns #t if all arguments are environments.",
+            kind: CompletionItemKind::Function,
+        },
+    );
 
     m
 }
@@ -469,7 +553,10 @@ impl GriftLanguageServer {
             Err(ArenaError::ParseError) => {
                 vec![Diagnostic {
                     range: Range {
-                        start: Position { line: 0, character: 0 },
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
                         end: Position {
                             line: 0,
                             character: text.lines().next().map_or(0, |l| l.len() as u32),
@@ -485,7 +572,10 @@ impl GriftLanguageServer {
                 // we could ignore these, but surfacing them is helpful.
                 vec![Diagnostic {
                     range: Range {
-                        start: Position { line: 0, character: 0 },
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
                         end: Position {
                             line: 0,
                             character: text.lines().next().map_or(0, |l| l.len() as u32),
@@ -556,7 +646,8 @@ fn word_at_position(text: &str, pos: &Position) -> Option<String> {
     }
 
     let bytes = line.as_bytes();
-    let is_symbol_char = |b: u8| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'(' | b')' | b'"' | b';');
+    let is_symbol_char =
+        |b: u8| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'(' | b')' | b'"' | b';');
 
     let mut start = col;
     while start > 0 && is_symbol_char(bytes[start - 1]) {
@@ -603,8 +694,8 @@ pub fn read_message<R: BufRead>(reader: &mut R) -> io::Result<Option<RpcMessage>
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body)?;
 
-    let msg: RpcMessage = serde_json::from_slice(&body)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let msg: RpcMessage =
+        serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(Some(msg))
 }
 
@@ -617,15 +708,16 @@ pub fn write_message<W: Write>(writer: &mut W, json: &[u8]) -> io::Result<()> {
 
 /// Serialize and send an RPC response.
 pub fn send_response<W: Write>(writer: &mut W, response: &RpcResponse) -> io::Result<()> {
-    let json = serde_json::to_vec(response)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let json = serde_json::to_vec(response).map_err(io::Error::other)?;
     write_message(writer, &json)
 }
 
 /// Serialize and send an RPC notification.
-pub fn send_notification<W: Write>(writer: &mut W, notification: &RpcNotification) -> io::Result<()> {
-    let json = serde_json::to_vec(notification)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+pub fn send_notification<W: Write>(
+    writer: &mut W,
+    notification: &RpcNotification,
+) -> io::Result<()> {
+    let json = serde_json::to_vec(notification).map_err(io::Error::other)?;
     write_message(writer, &json)
 }
 
@@ -648,10 +740,22 @@ mod tests {
     #[test]
     fn test_word_at_position() {
         let text = "(define! x 42)";
-        let word = word_at_position(text, &Position { line: 0, character: 3 });
+        let word = word_at_position(
+            text,
+            &Position {
+                line: 0,
+                character: 3,
+            },
+        );
         assert_eq!(word, Some("define!".into()));
 
-        let word = word_at_position(text, &Position { line: 0, character: 0 });
+        let word = word_at_position(
+            text,
+            &Position {
+                line: 0,
+                character: 0,
+            },
+        );
         assert_eq!(word, None); // on '('
     }
 
@@ -683,10 +787,17 @@ mod tests {
     #[test]
     fn test_hover_known_symbol() {
         let mut server = GriftLanguageServer::new();
-        server.documents.insert("file:///test.grift".into(), "(cons 1 2)".into());
+        server
+            .documents
+            .insert("file:///test.grift".into(), "(cons 1 2)".into());
         let hover = server.handle_hover(HoverParams {
-            text_document: TextDocumentIdentifier { uri: "file:///test.grift".into() },
-            position: Position { line: 0, character: 2 },
+            text_document: TextDocumentIdentifier {
+                uri: "file:///test.grift".into(),
+            },
+            position: Position {
+                line: 0,
+                character: 2,
+            },
         });
         assert!(hover.is_some());
         assert!(hover.unwrap().contents.value.contains("cons"));
@@ -695,10 +806,17 @@ mod tests {
     #[test]
     fn test_hover_unknown_symbol() {
         let mut server = GriftLanguageServer::new();
-        server.documents.insert("file:///test.grift".into(), "(foo 1 2)".into());
+        server
+            .documents
+            .insert("file:///test.grift".into(), "(foo 1 2)".into());
         let hover = server.handle_hover(HoverParams {
-            text_document: TextDocumentIdentifier { uri: "file:///test.grift".into() },
-            position: Position { line: 0, character: 2 },
+            text_document: TextDocumentIdentifier {
+                uri: "file:///test.grift".into(),
+            },
+            position: Position {
+                line: 0,
+                character: 2,
+            },
         });
         assert!(hover.is_none());
     }

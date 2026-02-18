@@ -54,17 +54,26 @@ pub struct CheckResult {
 impl CheckResult {
     /// Returns true if no errors were found.
     pub fn is_ok(&self) -> bool {
-        !self.diagnostics.iter().any(|d| d.severity == Severity::Error)
+        !self
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Error)
     }
 
     /// Returns only errors.
     pub fn errors(&self) -> Vec<&Diagnostic> {
-        self.diagnostics.iter().filter(|d| d.severity == Severity::Error).collect()
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect()
     }
 
     /// Returns only warnings.
     pub fn warnings(&self) -> Vec<&Diagnostic> {
-        self.diagnostics.iter().filter(|d| d.severity == Severity::Warning).collect()
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect()
     }
 }
 
@@ -151,7 +160,10 @@ fn check_brackets(source: &str, diagnostics: &mut Vec<Diagnostic>) {
                     diagnostics.push(Diagnostic {
                         severity: Severity::Error,
                         start: pos,
-                        end: Position { line: pos.line, col: pos.col + 1 },
+                        end: Position {
+                            line: pos.line,
+                            col: pos.col + 1,
+                        },
                         message: "Unmatched closing parenthesis".to_string(),
                     });
                 }
@@ -168,7 +180,10 @@ fn check_brackets(source: &str, diagnostics: &mut Vec<Diagnostic>) {
         diagnostics.push(Diagnostic {
             severity: Severity::Error,
             start: pos,
-            end: Position { line: pos.line, col: pos.col + 1 },
+            end: Position {
+                line: pos.line,
+                col: pos.col + 1,
+            },
             message: "Unmatched opening parenthesis".to_string(),
         });
     }
@@ -200,7 +215,10 @@ fn check_strings(source: &str, diagnostics: &mut Vec<Diagnostic>) {
                     diagnostics.push(Diagnostic {
                         severity: Severity::Error,
                         start: pos,
-                        end: Position { line: pos.line, col: pos.col + 1 },
+                        end: Position {
+                            line: pos.line,
+                            col: pos.col + 1,
+                        },
                         message: "Unterminated string literal".to_string(),
                     });
                 } else {
@@ -230,7 +248,11 @@ mod tests {
         let result = check("(+ 1 2");
         assert!(!result.is_ok());
         assert_eq!(result.errors().len(), 1);
-        assert!(result.errors()[0].message.contains("Unmatched opening parenthesis"));
+        assert!(
+            result.errors()[0]
+                .message
+                .contains("Unmatched opening parenthesis")
+        );
     }
 
     #[test]
@@ -238,7 +260,11 @@ mod tests {
         let result = check("(+ 1 2))");
         assert!(!result.is_ok());
         assert_eq!(result.errors().len(), 1);
-        assert!(result.errors()[0].message.contains("Unmatched closing parenthesis"));
+        assert!(
+            result.errors()[0]
+                .message
+                .contains("Unmatched closing parenthesis")
+        );
     }
 
     #[test]
