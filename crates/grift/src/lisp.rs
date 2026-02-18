@@ -29,6 +29,8 @@ pub struct Lisp<const N: usize> {
     pub(crate) inert_idx: ArenaIndex,
     /// Pre-allocated `#ignore`.
     pub(crate) ignore_idx: ArenaIndex,
+    /// Pre-allocated `#unit`.
+    pub(crate) unit_idx: ArenaIndex,
 }
 
 impl<const N: usize> Default for Lisp<N> {
@@ -49,7 +51,8 @@ impl<const N: usize> Lisp<N> {
         let false_idx = arena.alloc(Value::Boolean(false)).expect("arena too small for singletons");
         let inert_idx = arena.alloc(Value::Inert).expect("arena too small for singletons");
         let ignore_idx = arena.alloc(Value::Ignore).expect("arena too small for singletons");
-        Lisp { arena, true_idx, false_idx, inert_idx, ignore_idx }
+        let unit_idx = arena.alloc(Value::Unit).expect("arena too small for singletons");
+        Lisp { arena, true_idx, false_idx, inert_idx, ignore_idx, unit_idx }
     }
 
     // — Value constructors —
@@ -82,6 +85,12 @@ impl<const N: usize> Lisp<N> {
     #[inline]
     pub fn ignore(&self) -> ArenaResult<ArenaIndex> {
         Ok(self.ignore_idx)
+    }
+
+    /// Return the pre-allocated unit index (zero allocation).
+    #[inline]
+    pub fn unit(&self) -> ArenaResult<ArenaIndex> {
+        Ok(self.unit_idx)
     }
 
     /// Allocate a cons cell.
@@ -461,16 +470,28 @@ impl<const N: usize> Trace<Value, N> for Value {
                 tracer(car);
                 tracer(cdr);
             }
-            Value::Applicative(inner) => tracer(inner),
+            Value::Applicative(inner)
+            | Value::Pointer(inner)
+            | Value::Reference(inner) => tracer(inner),
             Value::Symbol(s) => tracer(s),
-            Value::String { data, .. } if !data.is_nil() => tracer(data),
+            Value::String { data, .. }
+            | Value::Array { data, .. }
+            | Value::Tuple { data, .. }
+            | Value::Slice { data, .. }
+                if !data.is_nil() =>
+            {
+                tracer(data);
+            }
             _ => {}
         }
     }
 
     fn trace_with_arena<F: FnMut(ArenaIndex)>(&self, arena: &Arena<Value, N>, mut tracer: F) {
         match *self {
-            Value::String { len, data } => {
+            Value::String { len, data }
+            | Value::Array { len, data }
+            | Value::Tuple { len, data }
+            | Value::Slice { len, data } => {
                 (0..len).for_each(|i| {
                     if let Ok(idx) = arena.index_at_offset(data, i) {
                         tracer(idx);

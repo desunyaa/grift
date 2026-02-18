@@ -681,15 +681,23 @@ fn test_tco_iterative_fib() {
 fn test_recursive_fib_30() {
     // Naive recursive fib(30) — previously crashed with OOM.
     // GC during evaluation reclaims intermediate values, allowing completion.
-    let lisp: Lisp<100_000> = Lisp::new();
-    let result = lisp.eval(
-        r#"
-        (begin
-            (define! fib (lambda (n)
-                (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2))))))
-            (fib 30))
-    "#,
-    );
+    // Runs on a thread with larger stack to accommodate deep recursion.
+    let result = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let lisp: Lisp<100_000> = Lisp::new();
+            lisp.eval(
+                r#"
+                (begin
+                    (define! fib (lambda (n)
+                        (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2))))))
+                    (fib 30))
+            "#,
+            )
+        })
+        .unwrap()
+        .join()
+        .unwrap();
     assert_eq!(result, Ok(Value::Number(832040)));
 }
 

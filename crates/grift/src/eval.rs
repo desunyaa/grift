@@ -199,6 +199,58 @@ define_builtins! {
         "make-environment" => bi_make_env => builtin_make_env,
         "make-empty-environment" => bi_make_empty_env => builtin_make_empty_env,
         "environment?" => bi_environmentp => builtin_environmentp,
+
+        // — New type predicates —
+        "unit?"      => bi_unitp      => builtin_unitp,
+        "string?"    => bi_stringp    => builtin_stringp,
+        "char?"      => bi_charp      => builtin_charp,
+        "callable?"  => bi_callablep  => builtin_callablep,
+        "i8?"        => bi_i8p        => builtin_i8p,
+        "i16?"       => bi_i16p       => builtin_i16p,
+        "i32?"       => bi_i32p       => builtin_i32p,
+        "i64?"       => bi_i64p       => builtin_i64p,
+        "i128?"      => bi_i128p      => builtin_i128p,
+        "u8?"        => bi_u8p        => builtin_u8p,
+        "u16?"       => bi_u16p       => builtin_u16p,
+        "u32?"       => bi_u32p       => builtin_u32p,
+        "u64?"       => bi_u64p       => builtin_u64p,
+        "u128?"      => bi_u128p      => builtin_u128p,
+        "usize?"     => bi_usizep     => builtin_usizep,
+        "f32?"       => bi_f32p       => builtin_f32p,
+        "f64?"       => bi_f64p       => builtin_f64p,
+        "array?"     => bi_arrayp     => builtin_arrayp,
+        "tuple?"     => bi_tuplep     => builtin_tuplep,
+        "slice?"     => bi_slicep     => builtin_slicep,
+        "pointer?"   => bi_pointerp   => builtin_pointerp,
+        "reference?" => bi_referencep => builtin_referencep,
+
+        // — Numeric cast/conversion builtins —
+        "->i8"    => bi_to_i8    => builtin_to_i8,
+        "->i16"   => bi_to_i16   => builtin_to_i16,
+        "->i32"   => bi_to_i32   => builtin_to_i32,
+        "->i64"   => bi_to_i64   => builtin_to_i64,
+        "->i128"  => bi_to_i128  => builtin_to_i128,
+        "->isize" => bi_to_isize => builtin_to_isize,
+        "->u8"    => bi_to_u8    => builtin_to_u8,
+        "->u16"   => bi_to_u16   => builtin_to_u16,
+        "->u32"   => bi_to_u32   => builtin_to_u32,
+        "->u64"   => bi_to_u64   => builtin_to_u64,
+        "->u128"  => bi_to_u128  => builtin_to_u128,
+        "->usize" => bi_to_usize => builtin_to_usize,
+        "->f32"   => bi_to_f32   => builtin_to_f32,
+        "->f64"   => bi_to_f64   => builtin_to_f64,
+
+        // — Compound type builtins —
+        "make-array"   => bi_make_array   => builtin_make_array,
+        "array-ref"    => bi_array_ref    => builtin_array_ref,
+        "array-length" => bi_array_length => builtin_array_length,
+        "make-tuple"   => bi_make_tuple   => builtin_make_tuple,
+        "tuple-ref"    => bi_tuple_ref    => builtin_tuple_ref,
+        "tuple-length" => bi_tuple_length => builtin_tuple_length,
+        "make-slice"   => bi_make_slice   => builtin_make_slice,
+        "make-pointer" => bi_make_pointer => builtin_make_pointer,
+        "deref"        => bi_deref        => builtin_deref,
+        "make-ref"     => bi_make_ref     => builtin_make_ref,
     }
 }
 
@@ -283,7 +335,7 @@ impl<'a, const N: usize> Evaluator<'a, N> {
         self.lisp.arena.collect_garbage(&[
             expr, env, self.ground_env, self.global_env, self.gc_roots,
             self.lisp.true_idx, self.lisp.false_idx,
-            self.lisp.inert_idx, self.lisp.ignore_idx,
+            self.lisp.inert_idx, self.lisp.ignore_idx, self.lisp.unit_idx,
         ]);
     }
 
@@ -1043,6 +1095,281 @@ impl<'a, const N: usize> Evaluator<'a, N> {
 
     type_predicate!(builtin_environmentp, Value::Environment { .. });
     type_predicate!(builtin_ignorep, Value::Ignore);
+
+    // — New type predicates —
+    type_predicate!(builtin_unitp, Value::Unit);
+    type_predicate!(builtin_stringp, Value::String { .. });
+    type_predicate!(builtin_charp, Value::Char(_));
+    type_predicate!(
+        builtin_callablep,
+        Value::Operative { .. } | Value::Applicative(_) | Value::Builtin(_)
+    );
+    type_predicate!(builtin_i8p, Value::I8(_));
+    type_predicate!(builtin_i16p, Value::I16(_));
+    type_predicate!(builtin_i32p, Value::I32(_));
+    type_predicate!(builtin_i64p, Value::I64(_));
+    type_predicate!(builtin_i128p, Value::I128(_));
+    type_predicate!(builtin_u8p, Value::U8(_));
+    type_predicate!(builtin_u16p, Value::U16(_));
+    type_predicate!(builtin_u32p, Value::U32(_));
+    type_predicate!(builtin_u64p, Value::U64(_));
+    type_predicate!(builtin_u128p, Value::U128(_));
+    type_predicate!(builtin_usizep, Value::Usize(_));
+    type_predicate!(builtin_f32p, Value::F32(_));
+    type_predicate!(builtin_f64p, Value::F64(_));
+    type_predicate!(builtin_arrayp, Value::Array { .. });
+    type_predicate!(builtin_tuplep, Value::Tuple { .. });
+    type_predicate!(builtin_slicep, Value::Slice { .. });
+    type_predicate!(builtin_pointerp, Value::Pointer(_));
+    type_predicate!(builtin_referencep, Value::Reference(_));
+
+    // — Numeric cast builtins —
+    // Each converts any numeric value to the target type.
+
+    fn builtin_to_i8(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let n = self.lisp.get(self.lisp.car(args)?)?.to_isize()?;
+        let val = i8::try_from(n).map_err(|_| ArenaError::ArithmeticOverflow)?;
+        self.lisp.arena.alloc(Value::I8(val))
+    }
+
+    fn builtin_to_i16(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let n = self.lisp.get(self.lisp.car(args)?)?.to_isize()?;
+        let val = i16::try_from(n).map_err(|_| ArenaError::ArithmeticOverflow)?;
+        self.lisp.arena.alloc(Value::I16(val))
+    }
+
+    fn builtin_to_i32(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let n = self.lisp.get(self.lisp.car(args)?)?.to_isize()?;
+        let val = i32::try_from(n).map_err(|_| ArenaError::ArithmeticOverflow)?;
+        self.lisp.arena.alloc(Value::I32(val))
+    }
+
+    fn builtin_to_i64(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let n = self.lisp.get(self.lisp.car(args)?)?.to_isize()?;
+        self.lisp.arena.alloc(Value::I64(n as i64))
+    }
+
+    fn builtin_to_i128(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let n = self.lisp.get(self.lisp.car(args)?)?.to_isize()?;
+        self.lisp.arena.alloc(Value::I128(n as i128))
+    }
+
+    fn builtin_to_isize(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let n = self.lisp.get(self.lisp.car(args)?)?.to_isize()?;
+        self.lisp.number(n)
+    }
+
+    fn builtin_to_u8(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let n = self.lisp.get(self.lisp.car(args)?)?.to_isize()?;
+        let val = u8::try_from(n).map_err(|_| ArenaError::ArithmeticOverflow)?;
+        self.lisp.arena.alloc(Value::U8(val))
+    }
+
+    fn builtin_to_u16(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let n = self.lisp.get(self.lisp.car(args)?)?.to_isize()?;
+        let val = u16::try_from(n).map_err(|_| ArenaError::ArithmeticOverflow)?;
+        self.lisp.arena.alloc(Value::U16(val))
+    }
+
+    fn builtin_to_u32(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let n = self.lisp.get(self.lisp.car(args)?)?.to_isize()?;
+        let val = u32::try_from(n).map_err(|_| ArenaError::ArithmeticOverflow)?;
+        self.lisp.arena.alloc(Value::U32(val))
+    }
+
+    fn builtin_to_u64(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let n = self.lisp.get(self.lisp.car(args)?)?.to_isize()?;
+        let val = u64::try_from(n).map_err(|_| ArenaError::ArithmeticOverflow)?;
+        self.lisp.arena.alloc(Value::U64(val))
+    }
+
+    fn builtin_to_u128(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let n = self.lisp.get(self.lisp.car(args)?)?.to_isize()?;
+        let val = u128::try_from(n).map_err(|_| ArenaError::ArithmeticOverflow)?;
+        self.lisp.arena.alloc(Value::U128(val))
+    }
+
+    fn builtin_to_usize(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let n = self.lisp.get(self.lisp.car(args)?)?.to_isize()?;
+        let val = usize::try_from(n).map_err(|_| ArenaError::ArithmeticOverflow)?;
+        self.lisp.arena.alloc(Value::Usize(val))
+    }
+
+    fn builtin_to_f32(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let v = self.lisp.get(self.lisp.car(args)?)?;
+        let f = match v {
+            Value::F32(n) => n,
+            Value::F64(n) => n as f32,
+            _ => v.to_isize()? as f32,
+        };
+        self.lisp.arena.alloc(Value::F32(f))
+    }
+
+    fn builtin_to_f64(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let v = self.lisp.get(self.lisp.car(args)?)?;
+        let f = match v {
+            Value::F64(n) => n,
+            Value::F32(n) => n as f64,
+            _ => v.to_isize()? as f64,
+        };
+        self.lisp.arena.alloc(Value::F64(f))
+    }
+
+    // — Compound type builtins —
+
+    /// `(make-array . elements)` — create a fixed-size array from arguments.
+    fn builtin_make_array(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let len = self.list_length(args)?;
+        if len == 0 {
+            return self.lisp.arena.alloc(Value::Array {
+                len: 0,
+                data: ArenaIndex::NIL,
+            });
+        }
+        let data = self.lisp.arena.alloc_contiguous(len, Value::Nil)?;
+        let mut cur = args;
+        for i in 0..len {
+            let elem = self.lisp.car(cur)?;
+            let idx = self.lisp.arena.index_at_offset(data, i)?;
+            self.lisp.arena.set(idx, self.lisp.get(elem)?)?;
+            cur = self.lisp.cdr(cur)?;
+        }
+        self.lisp.arena.alloc(Value::Array { len, data })
+    }
+
+    /// `(array-ref array index)` — access element at index.
+    fn builtin_array_ref(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let arr_idx = self.lisp.car(args)?;
+        let arr = self.lisp.get(arr_idx)?;
+        let (len, data) = match arr {
+            Value::Array { len, data } => (len, data),
+            _ => return Err(ArenaError::TypeError),
+        };
+        let i = self.lisp.get(self.lisp.cadr(args)?)?.to_isize()?;
+        let i = usize::try_from(i).map_err(|_| ArenaError::InvalidArgument)?;
+        if i >= len {
+            return Err(ArenaError::InvalidArgument);
+        }
+        self.lisp.arena.index_at_offset(data, i)
+    }
+
+    /// `(array-length array)` — return the length of an array.
+    fn builtin_array_length(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let arr = self.lisp.get(self.lisp.car(args)?)?;
+        let len = match arr {
+            Value::Array { len, .. } => len,
+            _ => return Err(ArenaError::TypeError),
+        };
+        self.lisp.number(len as isize)
+    }
+
+    /// `(make-tuple . elements)` — create a tuple from arguments.
+    fn builtin_make_tuple(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let len = self.list_length(args)?;
+        if len == 0 {
+            return self.lisp.arena.alloc(Value::Tuple {
+                len: 0,
+                data: ArenaIndex::NIL,
+            });
+        }
+        let data = self.lisp.arena.alloc_contiguous(len, Value::Nil)?;
+        let mut cur = args;
+        for i in 0..len {
+            let elem = self.lisp.car(cur)?;
+            let idx = self.lisp.arena.index_at_offset(data, i)?;
+            self.lisp.arena.set(idx, self.lisp.get(elem)?)?;
+            cur = self.lisp.cdr(cur)?;
+        }
+        self.lisp.arena.alloc(Value::Tuple { len, data })
+    }
+
+    /// `(tuple-ref tuple index)` — access element at index.
+    fn builtin_tuple_ref(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let tup_idx = self.lisp.car(args)?;
+        let tup = self.lisp.get(tup_idx)?;
+        let (len, data) = match tup {
+            Value::Tuple { len, data } => (len, data),
+            _ => return Err(ArenaError::TypeError),
+        };
+        let i = self.lisp.get(self.lisp.cadr(args)?)?.to_isize()?;
+        let i = usize::try_from(i).map_err(|_| ArenaError::InvalidArgument)?;
+        if i >= len {
+            return Err(ArenaError::InvalidArgument);
+        }
+        self.lisp.arena.index_at_offset(data, i)
+    }
+
+    /// `(tuple-length tuple)` — return the length of a tuple.
+    fn builtin_tuple_length(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let tup = self.lisp.get(self.lisp.car(args)?)?;
+        let len = match tup {
+            Value::Tuple { len, .. } => len,
+            _ => return Err(ArenaError::TypeError),
+        };
+        self.lisp.number(len as isize)
+    }
+
+    /// `(make-slice array start end)` — create a slice view of an array.
+    fn builtin_make_slice(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let arr_idx = self.lisp.car(args)?;
+        let arr = self.lisp.get(arr_idx)?;
+        let (arr_len, arr_data) = match arr {
+            Value::Array { len, data } => (len, data),
+            _ => return Err(ArenaError::TypeError),
+        };
+        let rest = self.lisp.cdr(args)?;
+        let start = self.lisp.get(self.lisp.car(rest)?)?.to_isize()?;
+        let start = usize::try_from(start).map_err(|_| ArenaError::InvalidArgument)?;
+        let end = self.lisp.get(self.lisp.cadr(rest)?)?.to_isize()?;
+        let end = usize::try_from(end).map_err(|_| ArenaError::InvalidArgument)?;
+        if start > end || end > arr_len {
+            return Err(ArenaError::InvalidArgument);
+        }
+        let slice_len = end - start;
+        if slice_len == 0 {
+            return self.lisp.arena.alloc(Value::Slice {
+                len: 0,
+                data: ArenaIndex::NIL,
+            });
+        }
+        let slice_data = self.lisp.arena.index_at_offset(arr_data, start)?;
+        self.lisp.arena.alloc(Value::Slice {
+            len: slice_len,
+            data: slice_data,
+        })
+    }
+
+    /// `(make-pointer value)` — create a pointer to a value.
+    fn builtin_make_pointer(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let target = self.lisp.car(args)?;
+        self.lisp.arena.alloc(Value::Pointer(target))
+    }
+
+    /// `(deref pointer-or-ref)` — dereference a pointer or reference.
+    fn builtin_deref(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let ptr_idx = self.lisp.car(args)?;
+        match self.lisp.get(ptr_idx)? {
+            Value::Pointer(target) | Value::Reference(target) => Ok(target),
+            _ => Err(ArenaError::TypeError),
+        }
+    }
+
+    /// `(make-ref value)` — create a reference to a value.
+    fn builtin_make_ref(&self, args: ArenaIndex) -> ArenaResult<ArenaIndex> {
+        let target = self.lisp.car(args)?;
+        self.lisp.arena.alloc(Value::Reference(target))
+    }
+
+    /// Count the length of a proper list.
+    fn list_length(&self, list: ArenaIndex) -> ArenaResult<usize> {
+        let mut cur = list;
+        let mut len = 0usize;
+        while !cur.is_nil() {
+            len += 1;
+            cur = self.lisp.cdr(cur)?;
+        }
+        Ok(len)
+    }
 
     /// Copy a cons-list into fresh cons cells (iterative).
     fn copy_list(&self, list: ArenaIndex) -> ArenaResult<ArenaIndex> {
