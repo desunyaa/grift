@@ -296,7 +296,7 @@ fn run_check(expr: &str) {
     }
 
     let result = grift_check::check(expr);
-    if result.is_ok() {
+    if result.diagnostics.is_empty() {
         println!("✓ No issues found.");
     } else {
         for d in &result.diagnostics {
@@ -344,7 +344,7 @@ fn main() {
                     args[2..].join(" ")
                 };
                 let result = grift_check::check(&input);
-                if result.is_ok() {
+                if result.diagnostics.is_empty() {
                     println!("✓ No issues found.");
                 } else {
                     for d in &result.diagnostics {
@@ -360,7 +360,9 @@ fn main() {
                             d.message
                         );
                     }
-                    std::process::exit(1);
+                    if !result.is_ok() {
+                        std::process::exit(1);
+                    }
                 }
                 return;
             }
