@@ -2948,3 +2948,379 @@ fn test_set_bang_enables_mutable_state() {
         Ok(Value::Number(42))
     );
 }
+
+// ============================================================================
+// Unit Type Tests
+// ============================================================================
+
+#[test]
+fn test_unit_literal() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("#unit"), Ok(Value::Unit));
+}
+
+#[test]
+fn test_unit_predicate() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(unit? #unit)"), Ok(Value::Boolean(true)));
+    assert_eq!(lisp.eval("(unit? 42)"), Ok(Value::Boolean(false)));
+    assert_eq!(lisp.eval("(unit? ())"), Ok(Value::Boolean(false)));
+}
+
+#[test]
+fn test_unit_distinct_from_nil() {
+    let lisp: Lisp<20000> = Lisp::new();
+    // Unit and nil are distinct types
+    assert_eq!(lisp.eval("(null? #unit)"), Ok(Value::Boolean(false)));
+    assert_eq!(lisp.eval("(unit? ())"), Ok(Value::Boolean(false)));
+}
+
+// ============================================================================
+// Typed Integer Literal Tests
+// ============================================================================
+
+#[test]
+fn test_i8_literal() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("42i8"), Ok(Value::I8(42)));
+    assert_eq!(lisp.eval("-1i8"), Ok(Value::I8(-1)));
+}
+
+#[test]
+fn test_i16_literal() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("1000i16"), Ok(Value::I16(1000)));
+}
+
+#[test]
+fn test_i32_literal() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("100000i32"), Ok(Value::I32(100000)));
+}
+
+#[test]
+fn test_i64_literal() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("100i64"), Ok(Value::I64(100)));
+}
+
+#[test]
+fn test_i128_literal() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("100i128"), Ok(Value::I128(100)));
+}
+
+#[test]
+fn test_u8_literal() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("255u8"), Ok(Value::U8(255)));
+}
+
+#[test]
+fn test_u16_literal() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("65535u16"), Ok(Value::U16(65535)));
+}
+
+#[test]
+fn test_u32_literal() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("100u32"), Ok(Value::U32(100)));
+}
+
+#[test]
+fn test_u64_literal() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("100u64"), Ok(Value::U64(100)));
+}
+
+#[test]
+fn test_u128_literal() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("100u128"), Ok(Value::U128(100)));
+}
+
+#[test]
+fn test_usize_literal() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("100usize"), Ok(Value::Usize(100)));
+}
+
+// ============================================================================
+// Float Literal Tests
+// ============================================================================
+
+#[test]
+fn test_f64_literal() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("3.14"), Ok(Value::F64(3.14)));
+    assert_eq!(lisp.eval("0.5"), Ok(Value::F64(0.5)));
+    assert_eq!(lisp.eval("-2.5"), Ok(Value::F64(-2.5)));
+}
+
+#[test]
+fn test_f32_literal() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("3.14f32"), Ok(Value::F32(3.14f32)));
+}
+
+#[test]
+fn test_f64_literal_explicit() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("3.14f64"), Ok(Value::F64(3.14)));
+}
+
+#[test]
+fn test_float_integer_suffix() {
+    let lisp: Lisp<20000> = Lisp::new();
+    // Integer with f32 suffix becomes f32
+    assert_eq!(lisp.eval("42f32"), Ok(Value::F32(42.0)));
+    assert_eq!(lisp.eval("42f64"), Ok(Value::F64(42.0)));
+}
+
+// ============================================================================
+// Type Predicate Tests
+// ============================================================================
+
+#[test]
+fn test_string_predicate() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval(r#"(string? "hello")"#), Ok(Value::Boolean(true)));
+    assert_eq!(lisp.eval("(string? 42)"), Ok(Value::Boolean(false)));
+}
+
+#[test]
+fn test_char_predicate() {
+    let lisp: Lisp<20000> = Lisp::new();
+    // Chars aren't directly parseable in current syntax, test via predicate on non-char
+    assert_eq!(lisp.eval("(char? 42)"), Ok(Value::Boolean(false)));
+    assert_eq!(lisp.eval(r#"(char? "hello")"#), Ok(Value::Boolean(false)));
+}
+
+#[test]
+fn test_callable_predicate() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(callable? +)"), Ok(Value::Boolean(true)));
+    assert_eq!(lisp.eval("(callable? (lambda (x) x))"), Ok(Value::Boolean(true)));
+    assert_eq!(lisp.eval("(callable? 42)"), Ok(Value::Boolean(false)));
+}
+
+#[test]
+fn test_i8_predicate() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(i8? 42i8)"), Ok(Value::Boolean(true)));
+    assert_eq!(lisp.eval("(i8? 42)"), Ok(Value::Boolean(false)));
+}
+
+#[test]
+fn test_f64_predicate() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(f64? 3.14)"), Ok(Value::Boolean(true)));
+    assert_eq!(lisp.eval("(f64? 42)"), Ok(Value::Boolean(false)));
+}
+
+#[test]
+fn test_f32_predicate() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(f32? 3.14f32)"), Ok(Value::Boolean(true)));
+    assert_eq!(lisp.eval("(f32? 3.14)"), Ok(Value::Boolean(false)));
+}
+
+// ============================================================================
+// Numeric Cast Tests
+// ============================================================================
+
+#[test]
+fn test_cast_to_i8() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(->i8 42)"), Ok(Value::I8(42)));
+    assert_eq!(lisp.eval("(->i8 -1)"), Ok(Value::I8(-1)));
+}
+
+#[test]
+fn test_cast_to_i8_overflow() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert!(lisp.eval("(->i8 200)").is_err());
+}
+
+#[test]
+fn test_cast_to_u8() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(->u8 255)"), Ok(Value::U8(255)));
+}
+
+#[test]
+fn test_cast_to_u8_negative() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert!(lisp.eval("(->u8 -1)").is_err());
+}
+
+#[test]
+fn test_cast_to_i32() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(->i32 1000)"), Ok(Value::I32(1000)));
+}
+
+#[test]
+fn test_cast_to_i64() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(->i64 1000)"), Ok(Value::I64(1000)));
+}
+
+#[test]
+fn test_cast_to_i128() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(->i128 1000)"), Ok(Value::I128(1000)));
+}
+
+#[test]
+fn test_cast_to_isize() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(->isize 42i8)"), Ok(Value::Number(42)));
+}
+
+#[test]
+fn test_cast_to_f64() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(->f64 42)"), Ok(Value::F64(42.0)));
+}
+
+#[test]
+fn test_cast_to_f32() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(->f32 42)"), Ok(Value::F32(42.0)));
+}
+
+#[test]
+fn test_cast_f64_to_f32() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(->f32 3.14)"), Ok(Value::F32(3.14f32)));
+}
+
+#[test]
+fn test_cast_f32_to_f64() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(->f64 3.14f32)"), Ok(Value::F64(3.14f32 as f64)));
+}
+
+#[test]
+fn test_cast_to_usize() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(->usize 42)"), Ok(Value::Usize(42)));
+}
+
+#[test]
+fn test_cast_chain() {
+    let lisp: Lisp<20000> = Lisp::new();
+    // Cast from isize -> i8 -> isize
+    assert_eq!(lisp.eval("(->isize (->i8 42))"), Ok(Value::Number(42)));
+}
+
+// ============================================================================
+// Array Tests
+// ============================================================================
+
+#[test]
+fn test_make_array() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(array? (make-array 1 2 3))"), Ok(Value::Boolean(true)));
+}
+
+#[test]
+fn test_array_ref() {
+    let lisp: Lisp<20000> = Lisp::new();
+    let result = lisp.eval("(begin (define! a (make-array 10 20 30)) (array-ref a 1))");
+    assert_eq!(result, Ok(Value::Number(20)));
+}
+
+#[test]
+fn test_array_length() {
+    let lisp: Lisp<20000> = Lisp::new();
+    let result = lisp.eval("(array-length (make-array 10 20 30))");
+    assert_eq!(result, Ok(Value::Number(3)));
+}
+
+#[test]
+fn test_array_empty() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(array-length (make-array))"), Ok(Value::Number(0)));
+}
+
+#[test]
+fn test_array_ref_out_of_bounds() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert!(lisp.eval("(begin (define! a (make-array 1 2 3)) (array-ref a 5))").is_err());
+}
+
+// ============================================================================
+// Tuple Tests
+// ============================================================================
+
+#[test]
+fn test_make_tuple() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(tuple? (make-tuple 1 #t 3))"), Ok(Value::Boolean(true)));
+}
+
+#[test]
+fn test_tuple_ref() {
+    let lisp: Lisp<20000> = Lisp::new();
+    let result = lisp.eval("(begin (define! t (make-tuple 10 #t 30)) (tuple-ref t 1))");
+    assert_eq!(result, Ok(Value::Boolean(true)));
+}
+
+#[test]
+fn test_tuple_length() {
+    let lisp: Lisp<20000> = Lisp::new();
+    let result = lisp.eval("(tuple-length (make-tuple 10 20 30))");
+    assert_eq!(result, Ok(Value::Number(3)));
+}
+
+// ============================================================================
+// Slice Tests
+// ============================================================================
+
+#[test]
+fn test_make_slice() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(
+        lisp.eval("(begin (define! a (make-array 10 20 30 40 50)) (slice? (make-slice a 1 3)))"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+// ============================================================================
+// Pointer and Reference Tests
+// ============================================================================
+
+#[test]
+fn test_make_pointer() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(pointer? (make-pointer 42))"), Ok(Value::Boolean(true)));
+}
+
+#[test]
+fn test_deref_pointer() {
+    let lisp: Lisp<20000> = Lisp::new();
+    let result = lisp.eval("(deref (make-pointer 42))");
+    assert_eq!(result, Ok(Value::Number(42)));
+}
+
+#[test]
+fn test_make_ref() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert_eq!(lisp.eval("(reference? (make-ref 42))"), Ok(Value::Boolean(true)));
+}
+
+#[test]
+fn test_deref_ref() {
+    let lisp: Lisp<20000> = Lisp::new();
+    let result = lisp.eval("(deref (make-ref 42))");
+    assert_eq!(result, Ok(Value::Number(42)));
+}
+
+#[test]
+fn test_deref_type_error() {
+    let lisp: Lisp<20000> = Lisp::new();
+    assert!(lisp.eval("(deref 42)").is_err());
+}
