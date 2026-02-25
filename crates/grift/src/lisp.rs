@@ -883,9 +883,9 @@ impl<const N: usize> Lisp<N> {
         io: &mut IoState,
         display: bool,
     ) -> crate::io::IoResult<()> {
-        let mut w = IoFmtWriter { io, error: None };
+        let mut w = crate::io::BufIoWriter::new(io, 1);
         let _ = self.fmt_value(idx, &mut w, display);
-        w.error.map_or(Ok(()), Err)
+        w.into_error().map_or(Ok(()), Err)
     }
 
     // — Arena introspection —
@@ -1027,35 +1027,6 @@ impl<const N: usize> Lisp<N> {
     }
 }
 
-// ============================================================================
-// IoFmtWriter — bridges core::fmt::Write to an IoState
-// ============================================================================
-
-/// A [`core::fmt::Write`] adapter that streams formatted output through an
-/// [`IoState`]'s `write_stream` function pointer to stdout (stream 1).
-///
-/// Used by [`Lisp::display_to_io`] and [`Lisp::write_to_io`] to avoid
-/// intermediate buffers. Any I/O error is captured in `error` and causes
-/// subsequent writes to short-circuit.
-struct IoFmtWriter<'a> {
-    io: &'a mut IoState,
-    error: Option<crate::io::IoErrorKind>,
-}
-
-impl core::fmt::Write for IoFmtWriter<'_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        if self.error.is_some() {
-            return Err(core::fmt::Error);
-        }
-        if let Err(e) = (self.io.write_stream)(1, s) {
-            self.error = Some(e);
-            return Err(core::fmt::Error);
-        }
-        Ok(())
-    }
-}
-
-// ============================================================================
 // ============================================================================
 // ArenaWriter — core::fmt::Write that builds a CharPair chain in the arena
 // ============================================================================
