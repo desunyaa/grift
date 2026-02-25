@@ -138,14 +138,63 @@ impl Default for IoState {
 // Streaming writer types
 // ============================================================================
 
-/// Streams output to a specific stream through a borrowed [`IoState`].
+/// Size of the fixed stack buffer used by [`StreamWriter`] and
+/// [`BufIoWriter`] to coalesce small writes into fewer function-pointer calls.
+const STREAM_BUF_SIZE: usize = 256;
+
+/// Buffered streaming writer that coalesces small writes into a fixed-size
+/// stack buffer before flushing through an [`IoState`]'s `write_stream`
+/// function pointer.
 ///
-/// Used by `raw-display` and `raw-write` builtins to walk the value tree
-/// and emit output without any intermediate buffer.
+/// This dramatically reduces the number of function-pointer (and potentially
+/// syscall) invocations when formatting complex values, since
+/// [`core::fmt::Write`] may emit many tiny string fragments (parentheses,
+/// spaces, individual characters).
+///
+/// The buffer is automatically flushed when full and when the writer is
+/// dropped, so callers don't need to flush explicitly.
 pub(crate) struct StreamWriter<'a> {
-    pub(crate) io: &'a core::cell::RefCell<IoState>,
-    pub(crate) stream: u8,
-    pub(crate) error: Option<IoErrorKind>,
+    io: &'a core::cell::RefCell<IoState>,
+    stream: u8,
+    error: Option<IoErrorKind>,
+    buf: [u8; STREAM_BUF_SIZE],
+    len: usize,
+}
+
+impl<'a> StreamWriter<'a> {
+    /// Create a new buffered stream writer targeting `stream` through `io`.
+    pub(crate) fn new(io: &'a core::cell::RefCell<IoState>, stream: u8) -> Self {
+        StreamWriter {
+            io,
+            stream,
+            error: None,
+            buf: [0u8; STREAM_BUF_SIZE],
+            len: 0,
+        }
+    }
+
+    /// Flush the internal buffer to the I/O backend.
+    ///
+    /// After flushing, the buffer is empty.  If an error has already been
+    /// recorded, this is a no-op.
+    pub(crate) fn flush(&mut self) {
+        if self.len > 0 && self.error.is_none() {
+            // The buffer always contains valid UTF-8 because we only ever
+            // copy bytes from `&str` inputs (see `write_str`).
+            if let Ok(s) = core::str::from_utf8(&self.buf[..self.len]) {
+                if let Err(e) = (self.io.borrow().write_stream)(self.stream, s) {
+                    self.error = Some(e);
+                }
+            }
+            self.len = 0;
+        }
+    }
+}
+
+impl Drop for StreamWriter<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
 }
 
 impl core::fmt::Write for StreamWriter<'_> {
@@ -153,9 +202,111 @@ impl core::fmt::Write for StreamWriter<'_> {
         if self.error.is_some() {
             return Err(core::fmt::Error);
         }
-        if let Err(e) = (self.io.borrow().write_stream)(self.stream, s) {
-            self.error = Some(e);
+        let bytes = s.as_bytes();
+        if self.len + bytes.len() <= STREAM_BUF_SIZE {
+            // Fast path: fits in remaining buffer space.
+            self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+            self.len += bytes.len();
+        } else if bytes.len() >= STREAM_BUF_SIZE {
+            // Large write: flush buffer first, then pass directly.
+            self.flush();
+            if self.error.is_some() {
+                return Err(core::fmt::Error);
+            }
+            if let Err(e) = (self.io.borrow().write_stream)(self.stream, s) {
+                self.error = Some(e);
+                return Err(core::fmt::Error);
+            }
+        } else {
+            // Doesn't fit but smaller than buffer: flush then buffer.
+            self.flush();
+            if self.error.is_some() {
+                return Err(core::fmt::Error);
+            }
+            self.buf[..bytes.len()].copy_from_slice(bytes);
+            self.len = bytes.len();
+        }
+        Ok(())
+    }
+}
+
+/// Buffered writer that streams formatted output through an [`IoState`]'s
+/// `write_stream` function pointer to a given stream.
+///
+/// Unlike [`StreamWriter`] which borrows the `IoState` through a `RefCell`,
+/// this writer takes a direct `&mut IoState` reference, avoiding
+/// runtime borrow-checking overhead.  Used by the public
+/// [`Lisp::display_to_io`] and [`Lisp::write_to_io`] APIs.
+pub(crate) struct BufIoWriter<'a> {
+    io: &'a mut IoState,
+    stream: u8,
+    error: Option<IoErrorKind>,
+    buf: [u8; STREAM_BUF_SIZE],
+    len: usize,
+}
+
+impl<'a> BufIoWriter<'a> {
+    /// Create a new buffered I/O writer for the given `stream`.
+    pub(crate) fn new(io: &'a mut IoState, stream: u8) -> Self {
+        BufIoWriter {
+            io,
+            stream,
+            error: None,
+            buf: [0u8; STREAM_BUF_SIZE],
+            len: 0,
+        }
+    }
+
+    /// Flush the internal buffer to the I/O backend.
+    pub(crate) fn flush(&mut self) {
+        if self.len > 0 && self.error.is_none() {
+            if let Ok(s) = core::str::from_utf8(&self.buf[..self.len]) {
+                if let Err(e) = (self.io.write_stream)(self.stream, s) {
+                    self.error = Some(e);
+                }
+            }
+            self.len = 0;
+        }
+    }
+
+    /// Return the captured error, if any.
+    pub(crate) fn into_error(mut self) -> Option<IoErrorKind> {
+        self.flush();
+        self.error
+    }
+}
+
+impl Drop for BufIoWriter<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+impl core::fmt::Write for BufIoWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        if self.error.is_some() {
             return Err(core::fmt::Error);
+        }
+        let bytes = s.as_bytes();
+        if self.len + bytes.len() <= STREAM_BUF_SIZE {
+            self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+            self.len += bytes.len();
+        } else if bytes.len() >= STREAM_BUF_SIZE {
+            self.flush();
+            if self.error.is_some() {
+                return Err(core::fmt::Error);
+            }
+            if let Err(e) = (self.io.write_stream)(self.stream, s) {
+                self.error = Some(e);
+                return Err(core::fmt::Error);
+            }
+        } else {
+            self.flush();
+            if self.error.is_some() {
+                return Err(core::fmt::Error);
+            }
+            self.buf[..bytes.len()].copy_from_slice(bytes);
+            self.len = bytes.len();
         }
         Ok(())
     }

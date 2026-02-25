@@ -4268,3 +4268,141 @@ fn test_prelude_loads() {
         .expect("failed to spawn thread");
     handler.join().expect("prelude thread panicked");
 }
+
+// ============================================================================
+// Buffered I/O tests
+// ============================================================================
+
+/// Verify that the buffered StreamWriter coalesces multiple small writes
+/// into fewer function-pointer calls for `raw-display`.
+#[test]
+fn test_io_buffered_stream_writer_coalesces_writes() {
+    use grift::IoState;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    std::thread_local! {
+        static OUTPUT: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+    }
+
+    fn counting_write(stream: u8, s: &str) -> grift::io::IoResult<()> {
+        if stream == 1 {
+            CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+            OUTPUT.with(|o| o.borrow_mut().push_str(s));
+        }
+        Ok(())
+    }
+
+    // Display a list like (1 2 3 4 5) which produces many small writes
+    // (parentheses, spaces, numbers). Without buffering, each would be a
+    // separate call. With buffering, they are coalesced.
+    CALL_COUNT.store(0, Ordering::SeqCst);
+    OUTPUT.with(|o| o.borrow_mut().clear());
+    let io = IoState { write_stream: counting_write, ..IoState::null() };
+    let lisp: Lisp<20000> = Lisp::with_io(io);
+    let _ = lisp.eval("(raw-display 1 (list 1 2 3 4 5))");
+
+    let calls = CALL_COUNT.load(Ordering::SeqCst);
+    OUTPUT.with(|o| {
+        // The output should be correct regardless of call count.
+        assert_eq!(*o.borrow(), "(1 2 3 4 5)");
+    });
+    // With buffering, the entire "(1 2 3 4 5)" (11 bytes) fits in one
+    // buffer flush. Without buffering, there would be 11+ calls.
+    assert!(calls < 5, "expected coalesced writes, got {calls} calls");
+}
+
+/// Verify that the buffered StreamWriter correctly handles output longer
+/// than the internal buffer (256 bytes) without truncation.
+#[test]
+fn test_io_buffered_stream_writer_long_output() {
+    use grift::IoState;
+
+    std::thread_local! {
+        static OUTPUT: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+    }
+
+    fn capture_write(stream: u8, s: &str) -> grift::io::IoResult<()> {
+        if stream == 1 { OUTPUT.with(|o| o.borrow_mut().push_str(s)); }
+        Ok(())
+    }
+
+    OUTPUT.with(|o| o.borrow_mut().clear());
+    let io = IoState { write_stream: capture_write, ..IoState::null() };
+    let lisp: Lisp<100_000> = Lisp::with_io(io);
+    // Build a long string (400 chars) that exceeds the 256-byte buffer.
+    let long_str = "x".repeat(400);
+    let expr = format!(r#"(raw-display 1 "{long_str}")"#);
+    let _ = lisp.eval(&expr);
+    OUTPUT.with(|o| {
+        assert_eq!(o.borrow().len(), 400, "buffered writer must not truncate long output");
+        assert!(o.borrow().chars().all(|c| c == 'x'));
+    });
+}
+
+/// Verify that `raw-write-str` batches character writes.
+#[test]
+fn test_io_batched_write_chars_to_stream() {
+    use grift::IoState;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    std::thread_local! {
+        static OUTPUT: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+    }
+
+    fn counting_write(stream: u8, s: &str) -> grift::io::IoResult<()> {
+        if stream == 1 {
+            CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+            OUTPUT.with(|o| o.borrow_mut().push_str(s));
+        }
+        Ok(())
+    }
+
+    CALL_COUNT.store(0, Ordering::SeqCst);
+    OUTPUT.with(|o| o.borrow_mut().clear());
+    let io = IoState { write_stream: counting_write, ..IoState::null() };
+    let lisp: Lisp<20000> = Lisp::with_io(io);
+    // Write a 20-char string via raw-write-str.
+    // Without batching, this would be 20 separate calls (one per char).
+    // With batching, it should be 1 call.
+    let _ = lisp.eval(r#"(raw-write-str 1 "abcdefghijklmnopqrst")"#);
+
+    let calls = CALL_COUNT.load(Ordering::SeqCst);
+    OUTPUT.with(|o| assert_eq!(*o.borrow(), "abcdefghijklmnopqrst"));
+    assert!(calls < 5, "expected batched char writes, got {calls} calls");
+}
+
+/// Verify that display_to_io uses buffered writes.
+#[test]
+fn test_io_buffered_display_to_io_coalesces() {
+    use grift::IoState;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    std::thread_local! {
+        static OUTPUT: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+    }
+
+    fn counting_write(stream: u8, s: &str) -> grift::io::IoResult<()> {
+        if stream == 1 {
+            CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+            OUTPUT.with(|o| o.borrow_mut().push_str(s));
+        }
+        Ok(())
+    }
+
+    let lisp: Lisp<20000> = Lisp::new();
+    let idx = lisp.eval_to_index("(list 1 2 3 4 5)").unwrap();
+    CALL_COUNT.store(0, Ordering::SeqCst);
+    OUTPUT.with(|o| o.borrow_mut().clear());
+    let mut io = IoState { write_stream: counting_write, ..IoState::null() };
+    lisp.display_to_io(idx, &mut io).unwrap();
+
+    let calls = CALL_COUNT.load(Ordering::SeqCst);
+    OUTPUT.with(|o| assert_eq!(*o.borrow(), "(1 2 3 4 5)"));
+    assert!(calls < 5, "expected coalesced writes via display_to_io, got {calls} calls");
+}

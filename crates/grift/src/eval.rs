@@ -1148,12 +1148,9 @@ impl<const N: usize> Lisp<N> {
         let rest = self.cdr(args)?;
         let val = self.car(rest)?;
         {
-            let mut w = crate::io::StreamWriter {
-                io: &self.io,
-                stream,
-                error: None,
-            };
+            let mut w = crate::io::StreamWriter::new(&self.io, stream);
             let _ = self.fmt_value(val, &mut w, display);
+            // Buffer is flushed on drop
         }
         Ok(val)
     }
@@ -1178,16 +1175,38 @@ impl<const N: usize> Lisp<N> {
         Ok(ArenaIndex::INERT)
     }
 
-    /// Walk a CharPair chain and write each character to a stream via I/O function pointers.
+    /// Walk a CharPair chain and write characters to a stream, batching them
+    /// in a stack buffer to minimise function-pointer calls.
     fn write_chars_to_stream(&self, stream: u8, mut idx: ArenaIndex) -> ArenaResult<()> {
+        let mut buf = [0u8; 256];
+        let mut len = 0usize;
         while !idx.is_nil() {
             let Value::CharPair { ch, cdr } = self.get(idx)? else {
+                // Flush partial output before reporting the error.
+                if len > 0 {
+                    if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+                        let _ = (self.io.borrow().write_stream)(stream, s);
+                    }
+                }
                 return Err(ArenaError::TypeError);
             };
-            let mut buf = [0u8; 4];
-            let s = ch.encode_utf8(&mut buf);
-            let _ = (self.io.borrow().write_stream)(stream, s);
+            let mut tmp = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut tmp);
+            if len + encoded.len() > buf.len() {
+                // Buffer full — flush.
+                if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+                    let _ = (self.io.borrow().write_stream)(stream, s);
+                }
+                len = 0;
+            }
+            buf[len..len + encoded.len()].copy_from_slice(encoded.as_bytes());
+            len += encoded.len();
             idx = cdr;
+        }
+        if len > 0 {
+            if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+                let _ = (self.io.borrow().write_stream)(stream, s);
+            }
         }
         Ok(())
     }
